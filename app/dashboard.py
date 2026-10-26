@@ -14,6 +14,7 @@ import copy
 import datetime as dt
 import json
 import os
+import math
 import sys
 
 import folium
@@ -223,10 +224,30 @@ max_cloud = st.sidebar.number_input(
     help="Rejects satellite scenes with higher cloud cover across the 100km tile."
 )
 
+st.sidebar.divider()
+st.sidebar.subheader("3. Claim & policy info (optional)")
+with st.sidebar.expander("📝 Claim & Insured Details", expanded=False):
+    claim_ref = st.text_input("Claim Reference / ID", value="", placeholder="e.g. CLM-2026-9041")
+    policy_no = st.text_input("Policy Number", value="", placeholder="e.g. POL-MH-458102")
+    claimant_name = st.text_input("Claimant / Farmer Name", value="", placeholder="e.g. Ramesh Patil")
+    crop_type = st.text_input("Insured Crop", value="", placeholder="e.g. Soybean / Cotton")
+    claimed_cause = st.selectbox(
+        "Claimed Peril",
+        ["Not specified", "Inundation / Flood", "Drought / Dry Spell", "Excess Rainfall", "Unseasonal Rain", "Other / Hail"]
+    )
+
+claim_info = {
+    "claim_ref": claim_ref.strip() or "Not provided",
+    "policy_no": policy_no.strip() or "Not provided",
+    "claimant_name": claimant_name.strip() or "Not provided",
+    "crop_type": crop_type.strip() or "Not specified",
+    "claimed_cause": claimed_cause if claimed_cause != "Not specified" else "Not specified",
+}
+
 # Run button
 st.sidebar.divider()
 run_disabled = st.session_state[SEL] is None
-if st.sidebar.button("🚀 Run screening for active field",
+if st.sidebar.button("🚀 Run assessment for active field",
                      type="primary", disabled=run_disabled):
     geom = st.session_state[SEL]["geom"]
     try:
@@ -251,7 +272,7 @@ if st.sidebar.button("🚀 Run screening for active field",
                                     eff["baseline_years"],
                                     canonical_settings(eff))
             run_id = new_run_id()
-            with st.spinner("Screening field with satellite observations…"):
+            with st.spinner("Processing satellite damage assessment…"):
                 try:
                     meta, procdir = fieldmod.prepare_rasters(
                         eff, geom, mode, ROOT, run_id)
@@ -261,7 +282,7 @@ if st.sidebar.button("🚀 Run screening for active field",
                                                 run_id))
                     res = fieldmod.assess_field(
                         eff, geom, mode, root=ROOT, run_id=run_id,
-                        rasters_dir=procdir, meta=meta)
+                        rasters_dir=procdir, meta=meta, claim_info=claim_info)
                     run_data = {
                         "run_id": run_id,
                         "param_key": current_key,
@@ -271,6 +292,7 @@ if st.sidebar.button("🚀 Run screening for active field",
                         "geom_wkt": geom.wkt,
                         "res": res,
                         "grid_summary": grid_summary,
+                        "claim_info": claim_info,
                     }
                     st.session_state[RUN] = run_data
                     save_assessment(run_data)
@@ -307,16 +329,49 @@ tab_assess, tab_compare = st.tabs(["📊 Field Assessment", "📁 Saved Runs & C
 # TAB 1: Assessment
 # ========================================================================== #
 with tab_assess:
-    st.title("🌱 FarmAid — Satellite Crop Screening")
-    badge_html = '<span class="badge-live">🔴 LIVE SATELLITE MODE</span>' if mode == "live" else '<span class="badge-demo">🔵 DEMO SIMULATION MODE</span>'
-    st.markdown(f"{badge_html} &nbsp; **Sentinel-2 observations vs multi-year healthy seasonal norms**", unsafe_allow_html=True)
-    st.caption("Provisional screening for academic research and demonstration — not certified crop loss insurance adjudication.")
+    st.title("🌾 FarmAid — Crop Damage Assessment System")
+    badge_html = '<span class="badge-live">🔴 LIVE SATELLITE MODE (COPERNICUS SENTINEL-2 L2A)</span>' if mode == "live" else '<span class="badge-demo">🔵 DEMO SIMULATION MODE (OFFLINE SYNTHETIC)</span>'
+    st.markdown(f"{badge_html} &nbsp; **Objective Satellite Damage Evidence for Crop Insurance Claim Adjudication**", unsafe_allow_html=True)
+    st.caption("Standardized spectral screening for farmers, loss adjusters, and state researchers comparing claimed loss events against multi-year healthy baselines.")
+
+    # 7-Step Workflow Guide
+    with st.expander("ℹ️ How This Assessment System Works (7-Step Workflow)", expanded=False):
+        st.markdown("""
+        1. **Select Field:** Enter geographic coordinates & width in the sidebar, or draw the exact farm boundary on the interactive map.
+        2. **Configure Dates:** Set the claimed observation period and historical baseline comparison years.
+        3. **Enter Claim Details:** Optionally enter Claim ID, Policy Number, Insured Name, and Crop Type for report branding.
+        4. **Review Pre-Run Summary:** Inspect the verified parcel geometry, area (ha/acres), and sensor parameters.
+        5. **Run Assessment:** Sentinel-2 surface reflectance observations are masked for clouds/shadows and evaluated against the baseline.
+        6. **Evaluate Findings:** Review affected percentage, estimated damage area, severity classification, and peril hypothesis.
+        7. **Export Evidentiary Dossier:** Download the official PDF Evidence Report, GeoJSON boundary, or JSON audit record.
+        """)
 
     if run is not None and not run_is_current:
-        st.warning("⚠️ The results shown below belong to a previous selection. Input parameters (dates, baseline, or boundary) have changed. Click 'Run screening' to update.")
+        st.warning("⚠️ The results shown below belong to a previous assessment run. Input parameters (dates, baseline, or boundary) have changed. Click 'Run assessment' to process the new parameters.")
 
-    if sel is None:
-        st.info("👋 Welcome! To begin, specify your field using coordinates in the sidebar (click 'Apply coordinates') or draw directly on the map below.")
+    # Pre-Assessment Review Card (always visible when field is selected)
+    if sel is not None:
+        ha_p = fieldmod.area_ha(sel["geom"])
+        ac_p = round(ha_p * HA_TO_ACRES, 2)
+        c_p = sel["geom"].centroid
+        b_years_str = ", ".join(str(y) for y in sorted(years)) if years else "None selected"
+
+        st.markdown(f"""
+        <div style="background-color: #f1f5f9; border-left: 4px solid #1e3a8a; padding: 10px 16px; border-radius: 4px; margin-bottom: 14px;">
+            <div style="font-size: 0.82rem; font-weight: 700; color: #1e3a8a; text-transform: uppercase;">
+                Step 3 Review — Pre-Assessment Configuration
+            </div>
+            <div style="display: flex; flex-wrap: wrap; gap: 18px; margin-top: 6px; font-size: 0.88rem; color: #1e293b;">
+                <div><b>Boundary Area:</b> {ha_p:.3f} ha (~{ac_p} acres)</div>
+                <div><b>Coordinates:</b> {c_p.y:.4f}°N, {c_p.x:.4f}°E</div>
+                <div><b>Claim Window:</b> {d_start.isoformat()} → {d_end.isoformat()}</div>
+                <div><b>Baseline Norm:</b> {b_years_str}</div>
+                <div><b>Mode:</b> {mode.upper()}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.info("👋 **Welcome to FarmAid.** Specify your field boundary using coordinates in the sidebar (click 'Apply coordinates') or draw directly on the map below to begin.")
 
     # ---------------------------------------------------------------------- #
     # Section C: Field Map
@@ -445,28 +500,46 @@ with tab_assess:
         st.divider()
 
         # ================================================================== #
-        # Section A: Field Screening Summary
+        # Section A: Executive Insurance Assessment Summary
         # ================================================================== #
-        st.subheader("Section A: Field screening summary")
+        st.subheader("Section A: Executive assessment summary & findings")
 
-        if m_.get("insufficient_data"):
+        is_insufficient = m_.get("insufficient_data", False)
+        is_no_evidence = m_.get("no_evidence_of_damage", False)
+        valid_pct_v = m_.get("valid_pct", 0.0)
+        sev_label = m_.get("severity", "unknown").capitalize()
+
+        if is_insufficient:
             st.error(
-                f"⚠️ **Insufficient data for a reliable screening** — only {m_['valid_pct']}% of the field had usable satellite observations. "
-                "Clouds, shadows, or satellite revisit gaps prevented a reliable view. This is a data limitation, NOT evidence of healthy crops."
+                f"⚠️ **ASSESSMENT INCONCLUSIVE — INSUFFICIENT USABLE SATELLITE DATA**  \n"
+                f"Only **{valid_pct_v}%** of the field boundary had clear observations after SCL cloud/shadow filtering "
+                f"(below the 30% reliability threshold). Cloud contamination or shadows prevented conclusive assessment. "
+                f"*This is a satellite data limitation, NOT evidence that the crop is undamaged.*"
             )
-        elif m_.get("no_evidence_of_damage"):
-            st.success("✓ **No evidence of significant crop stress detected** under current thresholds and available clear observations.")
+        elif is_no_evidence:
+            st.success(
+                f"✓ **ASSESSMENT COMPLETED — NO QUALIFYING VEGETATION DAMAGE DETECTED**  \n"
+                f"Field greenness during the claimed observation window tracked within historical healthy norms "
+                f"(0.0% qualifying negative anomaly across {valid_pct_v}% clear observations)."
+            )
+        else:
+            st.warning(
+                f"⚠️ **ASSESSMENT COMPLETED — {sev_label.upper()} DAMAGE INDICATORS FLAGGED**  \n"
+                f"An estimated **{m_['affected_pct']}%** of the assessable field area (~{m_.get('affected_area_ha', 0)} ha) "
+                f"exhibits statistically significant vegetation depression (z < -1.5) relative to multi-year healthy baselines."
+            )
 
         area_ha_v = m_["area_ha"]
         area_ac_v = round(area_ha_v * HA_TO_ACRES, 2)
         aff_ha_v = m_.get("affected_area_ha", 0)
         aff_ac_v = round(aff_ha_v * HA_TO_ACRES, 3)
 
+        # 4 Core KPI Cards with explicit insurance terminology
         c1, c2, c3, c4 = st.columns(4)
         with c1:
             st.markdown(f"""
             <div class="metric-card">
-                <div class="metric-title">Field area</div>
+                <div class="metric-title">Field Area (Total)</div>
                 <div class="metric-value">{area_ha_v} ha</div>
                 <div class="metric-sub">~{area_ac_v} acres inside boundary</div>
             </div>
@@ -474,26 +547,25 @@ with tab_assess:
         with c2:
             st.markdown(f"""
             <div class="metric-card">
-                <div class="metric-title">Usable satellite data</div>
-                <div class="metric-value">{m_['valid_pct']}%</div>
-                <div class="metric-sub">{m_.get('n_valid_pixels', '?')} clear pixels analyzed</div>
+                <div class="metric-title">Usable Data Coverage</div>
+                <div class="metric-value">{valid_pct_v}%</div>
+                <div class="metric-sub">{m_.get('n_valid_pixels', '?')} / {m_.get('n_field_pixels', '?')} clear pixels analyzed</div>
             </div>
             """, unsafe_allow_html=True)
         with c3:
             st.markdown(f"""
             <div class="metric-card">
-                <div class="metric-title">Area with possible stress</div>
-                <div class="metric-value">{m_['affected_pct']}%</div>
-                <div class="metric-sub">~{aff_ha_v} ha ({aff_ac_v} ac) screening estimate</div>
+                <div class="metric-title">Estimated Affected Area</div>
+                <div class="metric-value">{aff_ha_v} ha</div>
+                <div class="metric-sub">~{aff_ac_v} acres ({m_['affected_pct']}% of usable px)</div>
             </div>
             """, unsafe_allow_html=True)
         with c4:
-            sev_label = m_["severity"].capitalize()
             st.markdown(f"""
             <div class="metric-card">
-                <div class="metric-title">Screening level</div>
+                <div class="metric-title">Damage Severity Tier</div>
                 <div class="metric-value">{sev_label}</div>
-                <div class="metric-sub">Algorithm anomaly classification</div>
+                <div class="metric-sub">Threshold: None &lt;5%, Low 5-15%, Mod 15-35%, High &ge;35%</div>
             </div>
             """, unsafe_allow_html=True)
 
@@ -501,34 +573,48 @@ with tab_assess:
         with c5:
             cause_label = m_["cause"].capitalize()
             if m_["cause"] == "unknown":
-                cause_text = "Cannot determine from satellite data alone"
+                cause_text = "Unknown — Spectral evidence alone cannot reliably distinguish cause"
             elif m_["cause"] == "flood":
-                cause_text = "Waterlogging / Inundation signal (elevated moisture)"
+                cause_text = "Inundation / Waterlogging (Elevated NDWI moisture signal > 0.05)"
             elif m_["cause"] == "drought":
-                cause_text = "Persistent moisture deficit / Dryness pattern"
+                cause_text = "Moisture Deficit / Drought (Persistent vegetative drop without surface moisture)"
             else:
                 cause_text = cause_label
-            st.info(f"**Possible cause:** {cause_text}  \n*Indicator uncertainty:* {m_.get('uncertainty', 'unknown').capitalize()}")
+            st.info(f"**Likely Peril / Cause Hypothesis:** {cause_text}  \n*Spectral indicator uncertainty:* {m_.get('uncertainty', 'unknown').capitalize()}")
         with c6:
-            conf_val = "Low" if m_.get("uncertainty") == "high" or m_["valid_pct"] < 50 else ("Medium" if m_.get("uncertainty") == "medium" else "High")
-            st.info(f"**Confidence in this screening:** {conf_val}  \n*Based on usable pixel coverage ({m_['valid_pct']}%) and baseline consistency.*")
+            conf_val = "Low / Inconclusive" if is_insufficient or m_.get("uncertainty") == "high" or valid_pct_v < 50 else ("Moderate" if m_.get("uncertainty") == "medium" else "Supported")
+            st.info(f"**Evidence Reliability Status:** {conf_val}  \n*Based on clear pixel coverage ({valid_pct_v}%), baseline consistency, and cloud mask checks.*")
 
         # ================================================================== #
-        # Section B: What Does This Mean? (Farmer Guidance)
+        # Section B: Guidance & Terminology Explanations
         # ================================================================== #
-        st.subheader("Section B: What does this mean?")
-        with st.expander("📖 Plain-language explanation & practical guidance", expanded=True):
+        st.subheader("Section B: Claim interpretation & technical definitions")
+        with st.expander("📖 Understanding This Assessment — Metric Definitions & Plain-Language Guide", expanded=False):
+            st.markdown("""
+            **Technical Metrics Demystified for Farmers & Claim Assessors:**
+            - **NDVI (Normalized Difference Vegetation Index):** A satellite indicator of live green vegetation based on Red and Near-Infrared reflectance. Ranges from -1 to +1. Changes reflect canopy vigour, but do NOT directly measure harvest yield or prove crop loss on their own.
+            - **Baseline NDVI:** The multi-year average greenness of this exact field during the identical calendar window in historical healthy years.
+            - **NDVI Change (ΔNDVI = Observed − Baseline):** Negative values mean the canopy is less green than the historical reference. Small fluctuations (within ±0.05) are normal seasonal variation; larger drops indicate vegetative stress.
+            - **Z-Score (Standardized Anomaly):** Measures how many standard deviations the observed NDVI is from the historical baseline. A score of *z < -1.5* means the vegetative drop is statistically abnormal relative to historical variations.
+            - **Usable Data Coverage:** The percentage of field pixels remaining after cloud, dense shadow, water, and snow masking. It is **not** the crop health percentage. Coverage below 30% renders an assessment inconclusive.
+            - **Estimated Affected Area & Share:** The percentage of *usable, clear* field pixels meeting the anomaly threshold (*z < -1.5* AND *Observed < Baseline*), multiplied by the field area.
+            - **Damage Severity Classification:** Standardized categorization: None (<5%), Low (5–15%), Moderate (15–35%), or High (≥35% of clear field pixels flagged).
+            - **Likely Cause:** A spectral hypothesis based on moisture (NDWI) and dryness patterns. Where satellite data cannot distinguish causes (e.g. hail defoliation vs pests vs fertilizer timing), the system reports **Unknown**.
+            """)
+
+        with st.expander("📋 Loss Adjuster Verification Checklist & Next Steps", expanded=True):
             insights = generate_field_insights(m_, res.get("meta", {}))
+            st.markdown("**Evidence-Based Observations:**")
             for ins in insights:
                 st.markdown(f"- {ins}")
 
             st.markdown("---")
-            st.markdown("**Recommended next steps for the field manager / farmer:**")
+            st.markdown("**Field Verification Checklist for Claim Settlement:**")
             st.markdown(
-                "1. **Ground inspection:** Walk the flagged portions of the field to check for visible yellowing, standing water, pest attack, or soil differences.\n"
-                "2. **Adjacent field comparison:** Compare with adjacent fields planted with the same crop at the same growth stage.\n"
-                "3. **Check management records:** Consider recent fertilizer, irrigation, spray, or weeding dates that may influence greenness.\n"
-                "4. **Re-screen if cloudy:** If usable satellite data was low, repeat this screening during a clearer calendar window (e.g. post-monsoon October–November)."
+                "1. **On-Site Field Walk:** Inspect flagged sections of the parcel for physical crop lodging, pest infestation, flood silt lines, or soil erosion.\n"
+                "2. **Adjacent Parcel Cross-Check:** Verify whether neighboring plots with identical crop types exhibited similar vegetative decline during the same period.\n"
+                "3. **Agronomic Timeline Audit:** Compare sowing dates, fertilizer application logs, and irrigation schedules against the satellite observation window.\n"
+                "4. **Local Meteorological Data:** Cross-reference local automatic weather station (AWS) rainfall or temperature records with the claimed peril date."
             )
 
         # ================================================================== #
@@ -569,12 +655,21 @@ with tab_assess:
 
         with st.expander("🔬 Technical details & provenance (for agronomists & specialists)"):
             ev_meta = res.get("meta", {}).get("event", {})
+            b_mean_val = m_.get("baseline_ndvi_mean")
+            if b_mean_val is None and m_.get("ndvi_mean") is not None and m_.get("ndvi_delta") is not None:
+                b_mean_val = round(m_["ndvi_mean"] - m_["ndvi_delta"], 3)
+
+            def _fmt_stat(val, decimals=3):
+                if val is None or not isinstance(val, (int, float)) or not math.isfinite(val):
+                    return "N/A (insufficient clear data)"
+                return f"{val:.{decimals}f}"
+
             st.markdown(f"""
-            - **Observed NDVI mean:** `{m_.get('ndvi_mean')}`
-            - **Historical Baseline NDVI mean:** `{m_.get('ndvi_mean', 0) - (m_.get('ndvi_delta') or 0):.3f}`
-            - **ΔNDVI (Observed − Baseline):** `{m_.get('ndvi_delta')}`
-            - **Standardized Anomaly (z-score):** `{m_.get('z_score')}`
-            - **Normalized Difference Water Index (NDWI):** `{m_.get('ndwi_mean')}`
+            - **Observed NDVI mean:** `{_fmt_stat(m_.get('ndvi_mean'))}`
+            - **Historical Baseline NDVI mean:** `{_fmt_stat(b_mean_val)}`
+            - **ΔNDVI (Observed − Baseline):** `{_fmt_stat(m_.get('ndvi_delta'))}`
+            - **Standardized Anomaly (z-score):** `{_fmt_stat(m_.get('z_score'), 2)}`
+            - **Normalized Difference Water Index (NDWI):** `{_fmt_stat(m_.get('ndwi_mean'))}`
             - **Satellite sensor:** Sentinel-2 MSI L2A (`COPERNICUS/S2_SR_HARMONIZED`)
             - **Coordinate Reference System (CRS):** `{res.get('meta', {}).get('crs')}` @ 10m native pixel scale
             - **Observation window:** `{run['event_window'][0]} to {run['event_window'][1]}`
@@ -642,13 +737,36 @@ with tab_compare:
 
                 if rec.get("quicklook") and os.path.exists(rec["quicklook"]):
                     st.image(rec["quicklook"], caption=f"Satellite Evidence for {chosen_id}", width="stretch")
+                c_dl, c_load = st.columns(2)
                 if rec.get("pdf") and os.path.exists(rec["pdf"]):
                     with open(rec["pdf"], "rb") as fh:
-                        st.download_button(
+                        c_dl.download_button(
                             f"⬇ Download report PDF ({chosen_id})", fh.read(),
                             file_name=os.path.basename(rec["pdf"]), mime="application/pdf",
                             width="stretch"
                         )
+                if c_load.button("🔄 Reopen this assessment in active view", width="stretch"):
+                    import shapely.wkt
+                    geom_saved = shapely.wkt.loads(rec["geom_wkt"])
+                    st.session_state[SEL] = {
+                        "geom": geom_saved,
+                        "wkt": rec["geom_wkt"],
+                        "source": "reopened_saved",
+                        "applied_coords": None
+                    }
+                    st.session_state[RUN] = {
+                        "run_id": rec["run_id"],
+                        "param_key": rec["param_key"],
+                        "mode": rec.get("mode", "demo"),
+                        "event_window": rec.get("event_window"),
+                        "baseline_years": rec.get("baseline_years"),
+                        "geom_wkt": rec["geom_wkt"],
+                        "res": rec,
+                        "grid_summary": rec.get("grid_summary", {}),
+                        "claim_info": rec.get("claim_info", {}),
+                    }
+                    st.success(f"Assessment {chosen_id} loaded into active view! Switch to Tab 1 to inspect.")
+                    st.rerun()
 
         st.divider()
         st.subheader("Compare multiple assessments")

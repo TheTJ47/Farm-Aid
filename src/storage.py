@@ -44,6 +44,7 @@ def save_assessment(run_data, saved_dir=None):
         "metrics_json": res.get("metrics_json", run_data.get("metrics_json", "")),
         "quicklook": res.get("quicklook", run_data.get("quicklook", "")),
         "pdf": res.get("pdf", run_data.get("pdf", "")),
+        "claim_info": run_data.get("claim_info", res.get("claim_info", {})),
         "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     with open(save_path, "w", encoding="utf-8") as fh:

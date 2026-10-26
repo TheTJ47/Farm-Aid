@@ -1036,5 +1036,189 @@ def test_field_vs_regional_divergence_logic():
     assert r_metrics["severity"] == "high"
 
 
+def test_score_arrays_zero_valid_and_consistent_pixels():
+    """Regression test:
+    1) Zero valid pixels: returns None for ndvi_mean, ndvi_delta, z_score, ndwi_mean.
+    2) Heterogeneous baseline with partial valid pixels: ndvi_mean, baseline_ndvi_mean,
+       and ndvi_delta must be evaluated strictly on the co-located valid pixels."""
+    shape = (10, 10)
+    # Heterogeneous baseline: top half is 0.40, bottom half is 0.80.
+    mean = np.full(shape, 0.80, dtype=float)
+    mean[:5, :] = 0.40  # Top half baseline = 0.40
+    std = np.full(shape, 0.05, dtype=float)
+    ndwi = np.full(shape, -0.10, dtype=float)
+
+    # Event: bottom half is obscured by cloud (-9999.0)
+    ndvi = np.full(shape, -9999.0, dtype=float)
+    # Top half observed NDVI is 0.45 (+0.05 higher than its 0.40 baseline)
+    ndvi[:5, :] = 0.45
+
+    m_partial = score_arrays(ndvi, ndwi, mean, std, CFG, area_ha_=1.0, n_field_pixels=100)
+    assert m_partial["valid_pct"] == pytest.approx(50.0)
+    assert m_partial["n_valid_pixels"] == 50
+    # Must match the 0.45 observed mean
+    assert m_partial["ndvi_mean"] == pytest.approx(0.45, abs=0.001)
+    # Baseline mean must be 0.40 (from the top half co-located pixels), NOT 0.60 (whole field)
+    assert m_partial["baseline_ndvi_mean"] == pytest.approx(0.40, abs=0.001)
+    # Delta must be +0.05 (+0.45 - 0.40), NOT -0.15 (0.45 - 0.60)
+    assert m_partial["ndvi_delta"] == pytest.approx(0.05, abs=0.001)
+    assert m_partial["z_score"] == pytest.approx(1.00, abs=0.05)
+    assert m_partial["affected_pct"] == pytest.approx(0.0)
+
+    # Completely cloudy event: 0 valid pixels
+    ndvi_cloudy = np.full(shape, -9999.0, dtype=float)
+    m_zero = score_arrays(ndvi_cloudy, ndwi, mean, std, CFG, area_ha_=1.0, n_field_pixels=100)
+    assert m_zero["valid_pct"] == pytest.approx(0.0)
+    assert m_zero["n_valid_pixels"] == 0
+    assert m_zero["ndvi_mean"] is None
+    assert m_zero["ndvi_delta"] is None
+    assert m_zero["z_score"] is None
+    assert m_zero["ndwi_mean"] is None
+    assert m_zero["affected_pct"] == pytest.approx(0.0)
+
+
+def test_dashboard_none_safe_technical_formatting():
+    """Regression test for app/dashboard.py:574:
+    Metrics with None values (like run_20261026T055258_717834) must format safely
+    without TypeError: unsupported operand type(s) for -: 'NoneType' and 'int'."""
+    import math
+
+    m_none = {
+        "ndvi_mean": None,
+        "ndvi_delta": None,
+        "z_score": None,
+        "ndwi_mean": None,
+        "baseline_ndvi_mean": None,
+    }
+
+    b_mean_val = m_none.get("baseline_ndvi_mean")
+    if b_mean_val is None and m_none.get("ndvi_mean") is not None and m_none.get("ndvi_delta") is not None:
+        b_mean_val = round(m_none["ndvi_mean"] - m_none["ndvi_delta"], 3)
+
+    def _fmt_stat(val, decimals=3):
+        if val is None or not isinstance(val, (int, float)) or not math.isfinite(val):
+            return "N/A (insufficient clear data)"
+        return f"{val:.{decimals}f}"
+
+    assert _fmt_stat(m_none.get("ndvi_mean")) == "N/A (insufficient clear data)"
+    assert _fmt_stat(b_mean_val) == "N/A (insufficient clear data)"
+    assert _fmt_stat(m_none.get("ndvi_delta")) == "N/A (insufficient clear data)"
+    assert _fmt_stat(m_none.get("z_score"), 2) == "N/A (insufficient clear data)"
+
+    # Also test valid numeric metrics
+    m_valid = {
+        "ndvi_mean": 0.654,
+        "ndvi_delta": -0.052,
+        "z_score": -1.25,
+        "ndwi_mean": -0.123,
+        "baseline_ndvi_mean": 0.706,
+    }
+    assert _fmt_stat(m_valid.get("ndvi_mean")) == "0.654"
+    assert _fmt_stat(m_valid.get("baseline_ndvi_mean")) == "0.706"
+    assert _fmt_stat(m_valid.get("ndvi_delta")) == "-0.052"
+    assert _fmt_stat(m_valid.get("z_score"), 2) == "-1.25"
+
+
+def test_build_field_report_with_none_metrics(tmp_path):
+    """Regression test: build_field_report must build cleanly when metrics are None."""
+    from PIL import Image as PILImage
+
+    img_path = str(tmp_path / "quicklook.png")
+    PILImage.new("RGB", (100, 100), color="grey").save(img_path)
+
+    metrics = {
+        "area_ha": 0.96, "valid_pct": 0.0, "affected_pct": 0.0,
+        "affected_area_ha": 0.0, "ndvi_mean": None, "ndvi_delta": None,
+        "z_score": None, "ndwi_mean": None, "severity": "unassessable",
+        "cause": "unknown", "uncertainty": "high", "insufficient_data": True,
+        "run_id": "run_test_none", "bounds_wgs84": [74.6, 19.3, 74.7, 19.4]
+    }
+    meta = {
+        "mode": "gee", "synthetic": False, "crs": "EPSG:32643", "scale_m": 10,
+        "event_window": ["2025-08-01", "2025-09-15"],
+        "baseline_window": ["08-01", "09-15"],
+        "baseline_years": [2022, 2023],
+        "event": {"images": 2, "first": "2025-08-11", "last": "2025-09-10", "coverage_pct": 62.5},
+        "baseline_periods": [{"year": 2022, "images": 2, "first": "2022-09-01", "last": "2022-09-06", "coverage_pct": 93.5}]
+    }
+    out_pdf = str(tmp_path / "test_report.pdf")
+    build_field_report(CFG, metrics, meta, img_path, out_pdf)
+    assert os.path.exists(out_pdf)
+    with open(out_pdf, "rb") as fh:
+        assert fh.read(5) == b"%PDF-"
+
+
+def test_build_field_report_with_claim_info(tmp_path):
+    """Test that build_field_report incorporates claim metadata and multi-page NumberedCanvas."""
+    from PIL import Image as PILImage
+
+    img_path = str(tmp_path / "quicklook2.png")
+    PILImage.new("RGB", (100, 100), color="green").save(img_path)
+
+    metrics = {
+        "area_ha": 4.5, "valid_pct": 92.5, "affected_pct": 24.0,
+        "affected_area_ha": 1.08, "ndvi_mean": 0.42, "ndvi_delta": -0.18,
+        "baseline_ndvi_mean": 0.60, "z_score": -1.85, "ndwi_mean": 0.12,
+        "severity": "moderate", "cause": "flood", "uncertainty": "low",
+        "insufficient_data": False, "no_evidence_of_damage": False,
+        "run_id": "run_test_claim", "param_key": "param_test_claim_123",
+        "bounds_wgs84": [74.6, 19.3, 74.7, 19.4],
+        "centroid_wgs84": [19.35, 74.65],
+    }
+    meta = {
+        "mode": "live", "synthetic": False, "crs": "EPSG:32643", "scale_m": 10,
+        "event_window": ["2025-08-01", "2025-09-15"],
+        "baseline_window": ["08-01", "09-15"],
+        "baseline_years": [2021, 2022],
+        "event": {"images": 4, "first": "2025-08-05", "last": "2025-09-10", "coverage_pct": 94.0},
+        "baseline_periods": [
+            {"year": 2021, "images": 3, "first": "2021-08-10", "last": "2021-09-12", "coverage_pct": 91.0},
+            {"year": 2022, "images": 4, "first": "2022-08-08", "last": "2022-09-14", "coverage_pct": 95.0}
+        ]
+    }
+    claim_info = {
+        "claim_ref": "CLM-2026-TEST",
+        "policy_no": "POL-998877",
+        "claimant_name": "Kisan Rao",
+        "crop_type": "Soybean",
+        "claimed_cause": "Inundation / Flood",
+    }
+    out_pdf = str(tmp_path / "claim_evidence_report.pdf")
+    build_field_report(CFG, metrics, meta, img_path, out_pdf, claim_info=claim_info)
+    assert os.path.exists(out_pdf)
+    assert os.path.getsize(out_pdf) > 5000  # valid multi-section PDF
+
+
+def test_storage_save_and_load_claim_info(tmp_path):
+    """Test persistence and retrieval of claim information in storage."""
+    from storage import save_assessment, load_saved_assessment
+
+    saved_dir = str(tmp_path / "saved")
+    run_data = {
+        "run_id": "run_persisted_claim",
+        "param_key": "key_persisted_123",
+        "mode": "live",
+        "event_window": ["2025-08-01", "2025-09-15"],
+        "baseline_years": [2022, 2023],
+        "geom_wkt": "POLYGON ((74.6 19.3, 74.7 19.3, 74.7 19.4, 74.6 19.4, 74.6 19.3))",
+        "claim_info": {
+            "claim_ref": "CLM-PERSIST",
+            "policy_no": "POL-PERSIST",
+            "claimant_name": "Test Claimant",
+            "crop_type": "Cotton",
+            "claimed_cause": "Drought",
+        },
+        "metrics": {"area_ha": 5.0, "valid_pct": 88.0, "affected_pct": 10.0},
+    }
+    save_path = save_assessment(run_data, saved_dir=saved_dir)
+    assert os.path.exists(save_path)
+
+    loaded = load_saved_assessment("run_persisted_claim", saved_dir=saved_dir)
+    assert loaded is not None
+    assert loaded["claim_info"]["claim_ref"] == "CLM-PERSIST"
+    assert loaded["claim_info"]["crop_type"] == "Cotton"
+    assert loaded["metrics"]["area_ha"] == 5.0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

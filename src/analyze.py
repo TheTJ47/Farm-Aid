@@ -190,13 +190,20 @@ def run_grid(cfg, procdir, outdir):
             total_px = win.width * win.height
             valid_pct = 100.0 * n_valid / total_px
 
-            v_aff = (v_z < threshold) & (v_ndvi < v_mean)
+            common_mask = np.ma.getmaskarray(v_z)
+            v_ndvi_valid = np.ma.masked_where(common_mask, v_ndvi)
+            v_mean_valid = np.ma.masked_where(common_mask, v_mean)
+            v_ndwi_valid = np.ma.masked_where(common_mask, v_ndwi)
+
+            v_aff = (v_z < threshold) & (v_ndvi_valid < v_mean_valid)
             affected_frac = (float(np.ma.mean(v_aff)) if v_aff.count()
                              else 0.0)
-            ndvi_mean_c = float(np.ma.mean(v_ndvi))
-            ndwi_mean_c = float(np.ma.mean(v_ndwi))
-            delta = ndvi_mean_c - float(np.ma.mean(v_mean))
+            ndvi_mean_c = float(np.ma.mean(v_ndvi_valid))
+            baseline_mean_c = float(np.ma.mean(v_mean_valid))
+            delta = ndvi_mean_c - baseline_mean_c
             z_mean = float(np.ma.mean(v_z))
+            ndwi_mean_c = (float(np.ma.mean(v_ndwi_valid)) if v_ndwi_valid.count()
+                           else (float(np.ma.mean(v_ndwi)) if v_ndwi.count() else np.nan))
 
             severity = classify_severity(affected_frac, cut)
             cause, uncertainty = classify_cause(
