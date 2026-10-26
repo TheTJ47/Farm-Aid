@@ -46,7 +46,7 @@ from runmeta import canonical_settings, new_run_id, param_key, \
     results_are_current  # noqa: E402
 from storage import (DEFAULT_SAVED_DIR as SAVED_DIR,  # noqa: E402
                      list_saved_assessments, load_saved_assessment,
-                     save_assessment)
+                     load_active_assessment, save_assessment)
 
 # Distinct screening colors
 COLORS = {
@@ -123,9 +123,11 @@ st.markdown("""
 # --------------------------------------------------------------------------- #
 SEL = "sel"          # dict: {"geom": shapely, "wkt": str, "source": str, "applied_coords": tuple}
 RUN = "run"          # dict: run result + param_key + inputs used
+ACTIVE_RUN_ID = "active_run_id"  # str: active run ID returned by assessment or loaded from saved
+LAST_SUCCESS_MSG = "last_success_msg"  # str: success banner message synchronized with active run
 DRAW = "draw_seq"    # counter to detect new drawings
 
-for key, default in [(SEL, None), (RUN, None), (DRAW, 0)]:
+for key, default in [(SEL, None), (RUN, None), (ACTIVE_RUN_ID, None), (LAST_SUCCESS_MSG, None), (DRAW, 0)]:
     if key not in st.session_state:
         st.session_state[key] = default
 
@@ -183,6 +185,8 @@ if input_mode == "Coordinates (box)":
             "applied_coords": (lat, lon, size_km)
         }
         st.session_state[RUN] = None
+        st.session_state[ACTIVE_RUN_ID] = None
+        st.session_state[LAST_SUCCESS_MSG] = None
         st.sidebar.success("Active boundary updated from coordinates.")
         st.rerun()
 else:
@@ -275,6 +279,8 @@ if st.sidebar.button("🚀 Run before-and-after assessment",
         geom = validate_geometry(geom)
     except FarmAidDataError as e:
         st.session_state[RUN] = None
+        st.session_state[ACTIVE_RUN_ID] = None
+        st.session_state[LAST_SUCCESS_MSG] = None
         st.sidebar.error(str(e))
         geom = None
 
@@ -304,6 +310,8 @@ if st.sidebar.button("🚀 Run before-and-after assessment",
                     )
                     if discovery.get("data_sufficiency") == "insufficient":
                         st.session_state[RUN] = None
+                        st.session_state[ACTIVE_RUN_ID] = None
+                        st.session_state[LAST_SUCCESS_MSG] = None
                         st.sidebar.error(f"Assessment inconclusive — {discovery.get('notes')}")
                         geom = None
                     else:
@@ -326,22 +334,40 @@ if st.sidebar.button("🚀 Run before-and-after assessment",
                         "workflow_mode": workflow_mode,
                         "incident_date": inc_str,
                         "claimed_peril": claimed_peril,
+                        "event_window": eff.get("event_window"),
+                        "baseline_years": eff["baseline_years"],
                         "discovery": discovery,
                         "geom_wkt": geom.wkt,
                         "res": res,
                         "grid_summary": grid_summary,
                         "claim_info": claim_info,
                     }
-                    st.session_state[RUN] = run_data
                     save_assessment(run_data)
-                    st.sidebar.success(f"Incident assessment complete (Run ID: {run_id}).")
+                    loaded = load_active_assessment(run_id)
+                    if loaded is None:
+                        st.session_state[RUN] = None
+                        st.session_state[ACTIVE_RUN_ID] = None
+                        st.session_state[LAST_SUCCESS_MSG] = None
+                        st.sidebar.error(f"Failed to load assessment artifacts for {run_id}.")
+                    else:
+                        st.session_state[RUN] = loaded
+                        st.session_state[ACTIVE_RUN_ID] = run_id
+                        st.session_state[LAST_SUCCESS_MSG] = f"Incident assessment complete (Run ID: {run_id})."
+                        st.rerun()
             except (FarmAidDataError, Exception) as e:  # noqa: BLE001
                 st.session_state[RUN] = None
+                st.session_state[ACTIVE_RUN_ID] = None
+                st.session_state[LAST_SUCCESS_MSG] = None
                 st.sidebar.error(f"Assessment failed — {e}")
+
+if st.session_state.get(LAST_SUCCESS_MSG) and st.session_state.get(ACTIVE_RUN_ID):
+    st.sidebar.success(st.session_state[LAST_SUCCESS_MSG])
 
 if st.sidebar.button("🗑️ Clear all and reset"):
     st.session_state[SEL] = None
     st.session_state[RUN] = None
+    st.session_state[ACTIVE_RUN_ID] = None
+    st.session_state[LAST_SUCCESS_MSG] = None
     st.rerun()
 
 # --------------------------------------------------------------------------- #
@@ -349,14 +375,26 @@ if st.sidebar.button("🗑️ Clear all and reset"):
 # --------------------------------------------------------------------------- #
 sel = st.session_state.get(SEL)
 run = st.session_state.get(RUN)
+active_run_id = st.session_state.get(ACTIVE_RUN_ID)
+
+if active_run_id and run is None:
+    loaded = load_active_assessment(active_run_id)
+    if loaded is not None:
+        run = loaded
+        st.session_state[RUN] = loaded
+    else:
+        st.session_state[ACTIVE_RUN_ID] = None
+
 current_key = None
 if sel is not None:
     inc_str = incident_date_input.isoformat() if incident_date_input else dt.date.today().isoformat()
     eff_years = sorted(years) if years else [2022, 2023]
+    eff_cfg = copy.deepcopy(cfg)
+    eff_cfg["max_cloud_pct"] = max_cloud
     current_key = param_key(mode, sel["wkt"], [inc_str, workflow_mode, claimed_peril],
-                            eff_years, canonical_settings(cfg))
+                            eff_years, canonical_settings(eff_cfg))
 run_is_current = (run is not None and current_key is not None
-                  and results_are_current(run["param_key"], current_key))
+                  and results_are_current(run.get("param_key"), current_key))
 
 # --------------------------------------------------------------------------- #
 # Main Tabs
@@ -385,7 +423,11 @@ with tab_assess:
         """)
 
     if run is not None and not run_is_current:
-        st.warning("⚠️ The results shown below belong to a previous assessment run. Input parameters (dates, baseline, or boundary) have changed. Click 'Run assessment' to process the new parameters.")
+        st.warning(
+            f"⚠️ The results shown below belong to assessment run `{run['run_id']}`. "
+            "Input parameters (dates, baseline, or boundary) have changed since this run was generated. "
+            "Click 'Run before-and-after assessment' to process the new parameters."
+        )
 
     # Pre-Assessment Review Card (always visible when field is selected)
     if sel is not None:
@@ -457,10 +499,10 @@ with tab_assess:
         ).add_to(fg_aoi)
         fg_aoi.add_to(m)
 
-    # Layers 3 & 4 (Current run only)
-    if run_is_current:
+    # Layers 3 & 4 (Active run overlays)
+    if run is not None and run.get("res"):
         res = run["res"]
-        grid_geojson = os.path.join(res["outdir"], "damage.geojson")
+        grid_geojson = os.path.join(res.get("outdir", ""), "damage.geojson")
         if os.path.exists(grid_geojson):
             fg_grid = folium.FeatureGroup(name="③ Regional screening grid (~300m cells)", show=False)
             gdf_ = map_safe_geodataframe(gpd.read_file(grid_geojson))
@@ -476,7 +518,7 @@ with tab_assess:
             fg_grid.add_to(m)
 
         fg_field = folium.FeatureGroup(name="④ Areas flagged for possible crop stress", show=True)
-        if os.path.exists(res["geojson"]):
+        if os.path.exists(res.get("geojson", "")):
             fgf = map_safe_geodataframe(gpd.read_file(res["geojson"]),
                                         drop_columns=("geometry_wkt", "param_key"))
             if not fgf.empty:
@@ -498,7 +540,7 @@ with tab_assess:
     with col_map:
         map_out = st_folium(m, width="100%", height=480, key="farmaid_map",
                             returned_objects=["last_active_drawing"])
-        if map_out and isinstance(map_out, dict):
+        if input_mode == "Draw on map" and map_out and isinstance(map_out, dict):
             drawing = map_out.get("last_active_drawing")
             if drawing:
                 g2 = drawing.get("geometry") if isinstance(drawing, dict) else None
@@ -508,12 +550,15 @@ with tab_assess:
                 if g2:
                     try:
                         new_geom = validate_geometry(to_shape(g2))
-                        if new_geom.wkt != (st.session_state[SEL] or {}).get("wkt"):
+                        curr_geom = (st.session_state[SEL] or {}).get("geom")
+                        if curr_geom is None or not curr_geom.equals(new_geom):
                             st.session_state[SEL] = {
                                 "geom": new_geom, "wkt": new_geom.wkt, "source": "drawn",
                                 "applied_coords": None
                             }
                             st.session_state[RUN] = None
+                            st.session_state[ACTIVE_RUN_ID] = None
+                            st.session_state[LAST_SUCCESS_MSG] = None
                             st.rerun()
                     except FarmAidDataError as e:
                         st.error(f"Drawing rejected: {e}")
@@ -532,11 +577,11 @@ with tab_assess:
         st.caption("Basemap is for geographic orientation; calculations use Sentinel-2 observations.")
 
     # ---------------------------------------------------------------------- #
-    # Results Section (Only shown when run is current)
+    # Results Section (Shown whenever an active run is loaded)
     # ---------------------------------------------------------------------- #
-    if run_is_current:
+    if run is not None and run.get("res") is not None:
         res = run["res"]
-        m_ = res["metrics"]
+        m_ = res.get("metrics", {})
         st.divider()
 
         # ================================================================== #
@@ -871,27 +916,23 @@ with tab_compare:
                             width="stretch"
                         )
                 if c_load.button("🔄 Reopen this assessment in active view", width="stretch"):
-                    import shapely.wkt
-                    geom_saved = shapely.wkt.loads(rec["geom_wkt"])
-                    st.session_state[SEL] = {
-                        "geom": geom_saved,
-                        "wkt": rec["geom_wkt"],
-                        "source": "reopened_saved",
-                        "applied_coords": None
-                    }
-                    st.session_state[RUN] = {
-                        "run_id": rec["run_id"],
-                        "param_key": rec["param_key"],
-                        "mode": rec.get("mode", "demo"),
-                        "event_window": rec.get("event_window"),
-                        "baseline_years": rec.get("baseline_years"),
-                        "geom_wkt": rec["geom_wkt"],
-                        "res": rec,
-                        "grid_summary": rec.get("grid_summary", {}),
-                        "claim_info": rec.get("claim_info", {}),
-                    }
-                    st.success(f"Assessment {chosen_id} loaded into active view! Switch to Tab 1 to inspect.")
-                    st.rerun()
+                    loaded_active = load_active_assessment(chosen_id)
+                    if loaded_active is None:
+                        st.error(f"Failed to load assessment {chosen_id}.")
+                    else:
+                        import shapely.wkt
+                        geom_saved = shapely.wkt.loads(loaded_active["geom_wkt"])
+                        st.session_state[SEL] = {
+                            "geom": geom_saved,
+                            "wkt": loaded_active["geom_wkt"],
+                            "source": "reopened_saved",
+                            "applied_coords": None
+                        }
+                        st.session_state[RUN] = loaded_active
+                        st.session_state[ACTIVE_RUN_ID] = chosen_id
+                        st.session_state[LAST_SUCCESS_MSG] = f"Loaded saved assessment (Run ID: {chosen_id})."
+                        st.success(f"Assessment {chosen_id} loaded into active view! Switch to Tab 1 to inspect.")
+                        st.rerun()
 
         st.divider()
         st.subheader("Compare multiple assessments")

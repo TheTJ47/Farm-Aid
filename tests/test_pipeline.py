@@ -1282,5 +1282,146 @@ def test_incident_demo_before_after_comparison(tmp_path):
     assert os.path.exists(res["quicklook"])
 
 
+def test_consecutive_runs_and_active_run_activation(tmp_path):
+    """Test consecutive successful runs automatically update the active run and artifacts."""
+    from storage import save_assessment, load_active_assessment
+    saved_dir = str(tmp_path / "saved")
+
+    geom_wkt = "POLYGON ((74.63 19.37, 74.63 19.41, 74.67 19.41, 74.67 19.37, 74.63 19.37))"
+
+    # Run 1
+    run_id_1 = "run_20261026T100000_111111"
+    run_data_1 = {
+        "run_id": run_id_1,
+        "param_key": "key111",
+        "mode": "demo",
+        "workflow_mode": "historical",
+        "incident_date": "2025-08-15",
+        "claimed_peril": "Inundation / Flood",
+        "geom_wkt": geom_wkt,
+        "metrics": {"area_ha": 5.0, "affected_pct": 12.0, "severity": "low", "cause": "flood"},
+        "claim_info": {"claim_ref": "CLM-RUN-1"},
+    }
+    save_assessment(run_data_1, saved_dir=saved_dir)
+
+    active_1 = load_active_assessment(run_id_1, saved_dir=saved_dir)
+    assert active_1 is not None
+    assert active_1["run_id"] == run_id_1
+    assert active_1["claim_info"]["claim_ref"] == "CLM-RUN-1"
+
+    # Run 2 (consecutive run)
+    run_id_2 = "run_20261026T100500_222222"
+    run_data_2 = {
+        "run_id": run_id_2,
+        "param_key": "key222",
+        "mode": "demo",
+        "workflow_mode": "recent",
+        "incident_date": "2026-10-26",
+        "claimed_peril": "Drought / Dry Spell",
+        "geom_wkt": geom_wkt,
+        "metrics": {"area_ha": 5.0, "affected_pct": 28.0, "severity": "moderate", "cause": "drought"},
+        "claim_info": {"claim_ref": "CLM-RUN-2"},
+    }
+    save_assessment(run_data_2, saved_dir=saved_dir)
+
+    active_2 = load_active_assessment(run_id_2, saved_dir=saved_dir)
+    assert active_2 is not None
+    assert active_2["run_id"] == run_id_2
+    assert active_2["run_id"] != active_1["run_id"]
+    assert active_2["claim_info"]["claim_ref"] == "CLM-RUN-2"
+    assert active_2["metrics"]["affected_pct"] == 28.0
+
+
+def test_manual_saved_run_loading(tmp_path):
+    """Test manual loading of an existing saved run recovers complete active run dict."""
+    from storage import save_assessment, load_active_assessment, load_saved_assessment
+    saved_dir = str(tmp_path / "saved")
+
+    run_id = "run_historical_saved_test"
+    run_data = {
+        "run_id": run_id,
+        "param_key": "key_saved",
+        "mode": "live",
+        "workflow_mode": "historical",
+        "incident_date": "2025-08-15",
+        "claimed_peril": "Other / Hail",
+        "discovery": {
+            "selected_pre": {"date": "2025-08-11", "field_clear_pct": 95.0},
+            "selected_post": {"date": "2025-09-10", "field_clear_pct": 68.0},
+        },
+        "geom_wkt": "POLYGON ((74.6 19.3, 74.6 19.4, 74.7 19.4, 74.7 19.3, 74.6 19.3))",
+        "metrics": {"area_ha": 10.0, "affected_pct": 40.0, "severity": "high", "cause": "hail_suspected"},
+        "claim_info": {"claim_ref": "CLM-HAIL-77", "crop_type": "Pomegranate"},
+    }
+    save_assessment(run_data, saved_dir=saved_dir)
+
+    # Verify standard loader
+    rec = load_saved_assessment(run_id, saved_dir=saved_dir)
+    assert rec is not None
+    assert rec["run_id"] == run_id
+
+    # Verify active dashboard loader
+    active = load_active_assessment(run_id, saved_dir=saved_dir)
+    assert active is not None
+    assert active["run_id"] == run_id
+    assert active["workflow_mode"] == "historical"
+    assert active["claimed_peril"] == "Other / Hail"
+    assert active["discovery"]["selected_pre"]["date"] == "2025-08-11"
+    assert active["claim_info"]["claim_ref"] == "CLM-HAIL-77"
+    assert active["res"]["metrics"]["severity"] == "high"
+
+
+def test_artifact_loading_failure_prevents_silent_stale_display(tmp_path):
+    """Test that a nonexistent or corrupt saved run returns None instead of old data."""
+    from storage import load_active_assessment
+    saved_dir = str(tmp_path / "saved")
+    os.makedirs(saved_dir, exist_ok=True)
+
+    # Nonexistent run ID
+    assert load_active_assessment("run_nonexistent", saved_dir=saved_dir) is None
+
+    # Corrupt JSON file
+    corrupt_path = os.path.join(saved_dir, "run_corrupt.json")
+    with open(corrupt_path, "w") as fh:
+        fh.write("{ bad json ")
+    assert load_active_assessment("run_corrupt", saved_dir=saved_dir) is None
+
+    # Incomplete record (missing geom_wkt or metrics)
+    incomplete_path = os.path.join(saved_dir, "run_incomplete.json")
+    with open(incomplete_path, "w") as fh:
+        json.dump({"run_id": "run_incomplete"}, fh)
+    assert load_active_assessment("run_incomplete", saved_dir=saved_dir) is None
+
+
+def test_param_key_consistency_with_user_settings():
+    """Test that computing param_key with user max_cloud matches the run's fingerprint."""
+    import copy
+    from runmeta import canonical_settings, param_key, results_are_current
+
+    mode = "live"
+    geom_wkt = "POLYGON ((74.59 19.39, 74.59 19.40, 74.60 19.40, 74.60 19.39, 74.59 19.39))"
+    inc_str = "2026-10-26"
+    workflow_mode = "recent"
+    claimed_peril = "Inundation / Flood"
+    years = [2021, 2022, 2023, 2024]
+    user_max_cloud = 75
+
+    # During assessment execution:
+    eff = copy.deepcopy(CFG)
+    eff["max_cloud_pct"] = user_max_cloud
+    eff["baseline_years"] = sorted(years)
+    run_key = param_key(mode, geom_wkt, [inc_str, workflow_mode, claimed_peril],
+                        eff["baseline_years"], canonical_settings(eff))
+
+    # In dashboard staleness check:
+    eff_cfg = copy.deepcopy(CFG)
+    eff_cfg["max_cloud_pct"] = user_max_cloud
+    current_key = param_key(mode, geom_wkt, [inc_str, workflow_mode, claimed_peril],
+                            sorted(years), canonical_settings(eff_cfg))
+
+    # Must be current — no false staleness warning!
+    assert results_are_current(run_key, current_key) is True
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
