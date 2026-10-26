@@ -3,6 +3,29 @@
 Legend: `[x] written` (in this session, not executed) ·
 `[v] verified` (executed with recorded output) · `[ ]` to run.
 
+## v0.4.9 — Satellite-based crop damage insurance assessment core fixes (2026-10-26)
+### Verified in this session:
+- [v] Test suite execution (`.venv\Scripts\python.exe -m pytest -q`): **81 passed, 1 skipped (live EE)** in 24.59s (100% pass rate).
+- [v] Python compileall (`.venv\Scripts\python.exe -m compileall -q src app tests`): 0 errors across all files.
+- [v] CLI end-to-end execution: `python src/field.py --coords 19.39 74.65 0.5 --claim-ref CLM-TEST-001 --peril "Inundation / Flood"` completed with GeoJSON, PNG, and PDF outputs.
+- [v] Universal `claim_info` and keyword argument immunity (`src/field.py`): updated `assess_field` signature to `assess_field(..., claim_info=None, **kwargs)`.
+- [v] Incident date preservation without mutation (`src/incident.py`): eliminated the `-7 days` modification so user claimed dates agree across discovery, rasters, and reports.
+- [v] Observation-window metadata consistency: added exact observation window `[pre_date, post_date]` and search window across `incident.py`, `field.py`, `storage.py`, `dashboard.py`, and `report.py`.
+- [v] Calculation audit: verified strict separation between regional grid results and parcel-level calculations; confirmed denominators for `valid_pct` (`n_field_pixels`) and `affected_pct` (`n_valid`).
+- [v] Report improvements (`src/report.py`): added peril-specific loss adjuster verification checklists and explicit optical uncertainty principles.
+- [v] 4 new regression tests added (`tests/test_pipeline.py`): testing unexpected kwargs, date/window agreement, calculation denominators, and report generation.
+
+## v0.4.8 — Post-assessment dashboard loading & synchronization fix (2026-10-26)
+### Verified in this session:
+- [v] Test suite execution (`.venv\Scripts\python.exe -m pytest -q`): **77 passed, 1 skipped (live EE)** in 23.68s (100% pass rate).
+- [v] Python compileall (`.venv\Scripts\python.exe -m compileall -q src app tests`): 0 errors across all files.
+- [v] Root cause trace: resolved the mismatch where `canonical_settings(eff)` used the UI's `max_cloud` while `param_key` on line 356 evaluated `canonical_settings(cfg)` with `config.yaml` defaults, causing `run_is_current` to evaluate `False` and suppress the results section.
+- [v] Unified loading path (`src/storage.py::load_active_assessment`): automatic post-assessment completion and manual saved-run reopen in Tab 2 now use the identical, tested loader.
+- [v] Session-state synchronization: introduced `ACTIVE_RUN_ID` and `LAST_SUCCESS_MSG` in `st.session_state` to ensure run ID, success notifications, and rendered artifacts remain strictly synchronized across reruns.
+- [v] False-drawing event isolation: restricted Folium map drawing event processing strictly to `input_mode == "Draw on map"`, comparing geometry topology with `curr_geom.equals(new_geom)` to prevent accidental clearing of `RUN` state.
+- [v] Non-destructive staleness handling: Tab 1 results section and map overlays now render whenever an active run is loaded; parameter changes trigger a clear informational warning banner without hiding the active analysis.
+- [v] Regression tests added (`tests/test_pipeline.py`): 4 new tests verifying consecutive run activation, manual saved-run loading, artifact loading failure safety, and parameter key consistency.
+
 ## v0.4.6 — Live run audit, GeoTIFF nodata masking fix, and real calculation verification (2026-10-26)
 ### Verified in this session:
 - [v] Test suite execution (`.venv\Scripts\python.exe -m pytest -q --tb=short`): **66 passed, 1 skipped (live EE)**.

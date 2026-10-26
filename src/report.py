@@ -458,25 +458,51 @@ def generate_field_insights(metrics, meta):
             "deficit, disease, pests, or field management factors; ground inspection is needed.")
 
 
-    # --- Data quality ---
+    # --- Data quality & uncertainty ---
     valid_pct = m.get("valid_pct", 0)
     n_valid = m.get("n_valid_pixels")
     if valid_pct < 50:
         insights.append(
-            f"Only {valid_pct}% of pixels have valid data. Low coverage "
-            "substantially reduces confidence — cloud contamination, "
-            "terrain shadows, or partial overlap with the raster are "
-            "likely causes. Results should be treated with high uncertainty.")
+            f"Only {valid_pct}% of field pixels had valid clear observations. Low coverage "
+            "substantially reduces confidence — cloud contamination, terrain shadows, or "
+            "atmospheric haze are likely causes. Results carry high uncertainty and cannot rule out unobserved damage.")
     elif valid_pct < 80:
         insights.append(
             f"Valid data coverage is {valid_pct}%"
             + (f" ({n_valid} pixels)" if n_valid else "")
-            + ". Some pixels are masked, moderately reducing confidence.")
+            + ". Partial pixel masking moderately limits visibility across parts of the parcel.")
     else:
         insights.append(
             f"Valid data coverage is high ({valid_pct}%"
             + (f", {n_valid} pixels" if n_valid else "")
-            + "), supporting reasonable confidence in the screening results.")
+            + "), confirming clear optical visibility of the canopy during the satellite overpass. "
+            "Note: High clear coverage confirms optical observational completeness, but does not equate to "
+            "100% certainty of cause or yield loss without on-site loss adjustment.")
+
+    # --- Workflow and Peril specifics ---
+    is_inc = meta.get("workflow") == "incident_comparison"
+    if is_inc:
+        pre_d = (meta.get("pre_scene") or {}).get("date", "?")
+        post_d = (meta.get("post_scene") or {}).get("date", "?")
+        peril_name = meta.get("peril") or (m.get("claim_info") or {}).get("claimed_cause", "General")
+        insights.append(
+            f"Incident Before-and-After Analysis: Compares Sentinel-2 pass on {pre_d} (pre-incident benchmark) "
+            f"with pass on {post_d} (post-incident observation). Change in vegetative vigour: ΔNDVI = {delta}."
+        )
+        if "hail" in str(peril_name).lower():
+            insights.append(
+                "Claimed Peril — Hail: Optical multispectral sensors can observe acute defoliation and tearing between consecutive clear passes, "
+                "but cannot confirm hail impact without Doppler radar storm tracking or on-site hail stone impact marks."
+            )
+        elif "flood" in str(peril_name).lower() or "inundation" in str(peril_name).lower():
+            insights.append(
+                f"Claimed Peril — Inundation/Flood: Satellite moisture indicators (NDWI = {m.get('ndwi_mean', 'N/A')}) screen for "
+                "standing water or saturated soils accompanying vegetative decline."
+            )
+        elif "drought" in str(peril_name).lower() or "dry" in str(peril_name).lower():
+            insights.append(
+                "Claimed Peril — Drought: Persistent canopy dry-down without standing water indicates vegetative moisture stress."
+            )
 
     # --- Image count / baseline years ---
     ev = meta.get("event", {})
@@ -596,6 +622,8 @@ def build_field_report(cfg, metrics, meta, quicklook_path, out_path, claim_info=
     story.append(Paragraph("Crop Insurance Claim Verification & Damage Evidence Dossier", sub_style))
     story.append(Spacer(1, 3 * mm))
 
+    incident_date_val = str(c_info.get("incident_date") or meta.get("incident_date") or metrics.get("incident_date") or "Not specified")
+
     # Top Metadata Table (2-column layout: Claim / Insured info vs Technical Location info)
     meta_table_data = [
         [Paragraph("<b>Claim Reference:</b>", table_text), Paragraph(claim_ref, table_bold),
@@ -605,9 +633,9 @@ def build_field_report(cfg, metrics, meta, quicklook_path, out_path, claim_info=
         [Paragraph("<b>Claimant / Insured:</b>", table_text), Paragraph(claimant_name, table_bold),
          Paragraph("<b>Assessment Date:</b>", table_text), Paragraph(str(timestamp_str)[:19], table_text)],
         [Paragraph("<b>Insured Crop Type:</b>", table_text), Paragraph(crop_type, table_bold),
-         Paragraph("<b>Total Field Area:</b>", table_text), Paragraph(f"{area_ha} ha (~{area_ac} acres)", table_bold)],
+         Paragraph("<b>Claimed Incident Date:</b>", table_text), Paragraph(incident_date_val, table_bold)],
         [Paragraph("<b>Claimed Peril:</b>", table_text), Paragraph(claimed_peril, table_bold),
-         Paragraph("<b>Field Centroid:</b>", table_text), Paragraph(f"{metrics.get('centroid_wgs84', ['?','?'])[0]}°N, {metrics.get('centroid_wgs84', ['?','?'])[1]}°E", table_text)],
+         Paragraph("<b>Total Field Area:</b>", table_text), Paragraph(f"{area_ha} ha (~{area_ac} acres)", table_bold)],
     ]
     meta_t = Table(meta_table_data, colWidths=[36 * mm, 55 * mm, 40 * mm, 51 * mm])
     meta_t.setStyle(TableStyle([
@@ -744,7 +772,7 @@ def build_field_report(cfg, metrics, meta, quicklook_path, out_path, claim_info=
          Paragraph(f"UTM Projected CRS: {meta.get('crs', 'EPSG:32643')} @ 10m native scale", table_text)],
         [Paragraph("Parcel Coordinates", table_bold), Paragraph(f"Centroid: {metrics.get('centroid_wgs84', ['?','?'])[0]}°N, {metrics.get('centroid_wgs84', ['?','?'])[1]}°E", table_text),
          Paragraph(f"BBox: {metrics.get('bounds_wgs84', ['?','?','?','?'])}", table_text)],
-        [Paragraph("Claimed Incident Date", table_bold), Paragraph(str(meta.get("incident_date", "Not specified")), table_text),
+        [Paragraph("Claimed Incident Date", table_bold), Paragraph(incident_date_val, table_text),
          Paragraph(f"Comparison: Pre-event {pre_scene.get('date', '?')} vs Post-event {post_scene.get('date', '?')}" if is_incident else f"Obs Window: {meta.get('event_window')}", table_text)],
         [Paragraph("Baseline Composition", table_bold), Paragraph(f"Direct Pre-event Observation" if is_incident else f"Requested years: {meta.get('baseline_years')}", table_text),
          Paragraph(f"Pre-incident Sentinel-2 scene ({pre_scene.get('id', 'N/A')[:25]}...)" if is_incident else f"Successfully processed: {report_baseline_years(meta)}", table_text)],
@@ -950,11 +978,23 @@ def build_field_report(cfg, metrics, meta, quicklook_path, out_path, claim_info=
     # =========================================================================
     story.append(Paragraph("7. Limitations and Claim Adjuster Verification Checklist", h2))
     limits_text = (
-        "<b>Required Loss Adjustment Verification:</b><br/>"
-        "1. <b>Cloud & Atmospheric Gaps:</b> Monsoonal cloud cover may obscure optical observation on specific peak damage dates. Coverage below 30% is reported as Inconclusive.<br/>"
-        "2. <b>Phenological Stage Alignment:</b> Sowing delays, varietal differences, or staggered harvesting can alter NDVI curves without reflecting abiotic damage.<br/>"
-        "3. <b>Mandatory Ground-Truthing:</b> Satellite indicators should be corroborated by field inspection, geotagged crop photographs, loss adjuster reports, and local rain-gauge data.<br/>"
-        "4. <b>Agronomic Management:</b> Weeding, fertilizer application, spray drift, or intercropping can influence spectral response."
+        "<b>Core Evidentiary Constraints & Uncertainty Principles:</b><br/>"
+        "• <b>Optical Observation vs Biological Loss:</b> High clear data coverage (e.g. 100%) confirms optical data completeness "
+        "and clear view of the canopy during the overpass, but does NOT equate to 100% certainty of cause or yield loss. "
+        "Spectral decline can stem from natural senescence, harvest, lodging, weeds, or pests as well as weather perils.<br/>"
+        "• <b>Cloud & Temporal Gaps:</b> Cloud cover on the exact incident date may limit observation to the closest clear pass before/after.<br/>"
+        "• <b>Mandatory Ground-Truthing:</b> Satellite indicators provide spatial screening estimates for prioritization; physical ground "
+        "adjustment and claim adjudication remain mandatory.<br/><br/>"
+        "<b>Peril-Specific Loss Adjuster Verification Checklist:</b><br/>"
+        "1. <b>Inundation / Flood Claims:</b> Inspect for watermarks on crop stems, silt lines, or soil washouts; cross-reference local "
+        "Automatic Weather Station (AWS) 24h rainfall against claimed date; check whether flagged areas align with low field elevation.<br/>"
+        "2. <b>Drought / Dryness Claims:</b> Measure root-zone soil moisture depth and examine permanent wilting point symptoms; "
+        "review historical taluka-level rainfall deficit data and consecutive dry days during reproductive crop stages.<br/>"
+        "3. <b>Hail / Storm Claims:</b> Inspect plants for physical leaf shredding, stem bruising, or broken branches (optical satellites "
+        "observe defoliation as lower NDVI, but cannot distinguish hail impact from severe wind, cutting, or lodging without physical evidence); "
+        "cross-reference local Doppler radar hail probability or block revenue panchnama records.<br/>"
+        "4. <b>General / Management Cross-Check:</b> Verify sowing dates, seed variety, and fertilizer logs to ensure the anomaly does not "
+        "reflect staggered planting; compare vegetative condition of adjacent parcels with the identical crop type."
     )
     story.append(Paragraph(limits_text, small))
     story.append(Spacer(1, 3.5 * mm))

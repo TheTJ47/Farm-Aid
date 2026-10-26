@@ -14,6 +14,7 @@ Live-credential tests are skipped when Earth Engine is unavailable.
 
 Run:  python -m pytest -q
 """
+import copy
 import json
 import os
 import sys
@@ -37,6 +38,8 @@ import fetch_gee  # noqa: E402
 from fetch_gee import (FarmAidDataError, ensure_collection_size,
                        fetch_demo, selection_to_aoi)  # noqa: E402
 import field  # noqa: E402
+import field as fieldmod  # noqa: E402
+import incident as incidentmod  # noqa: E402
 from field import (area_ha, assess_field, evidence_state,
                    geometry_from_inputs, score_arrays,
                    sufficiency_flag, validate_geometry)  # noqa: E402
@@ -46,6 +49,7 @@ from runmeta import canonical_settings, new_run_id, param_key, \
 from report import (HA_TO_ACRES, build_field_report, build_report,
                     generate_field_insights)  # noqa: E402
 import storage  # noqa: E402
+from storage import save_assessment, load_active_assessment, load_saved_assessment  # noqa: E402
 from shapely.geometry import Point, box  # noqa: E402
 
 CUT = {"low": 0.05, "moderate": 0.15, "high": 0.35}
@@ -1421,6 +1425,168 @@ def test_param_key_consistency_with_user_settings():
 
     # Must be current — no false staleness warning!
     assert results_are_current(run_key, current_key) is True
+
+
+def test_assess_field_accepts_unexpected_kwargs_and_claim_info():
+    """Verify assess_field accepts claim_info and unexpected kwargs without error."""
+    with tempfile.TemporaryDirectory() as tmp:
+        mini_cfg = dict(CFG_DEMO)
+        mini_cfg.update({
+            "data_dir": "data",
+            "out_dir": "out",
+            "report_dir": "reports"
+        })
+        geom = box(74.645, 19.385, 74.655, 19.395)
+        claim_info = {
+            "claim_ref": "CLM-2026-TEST",
+            "policy_no": "POL-9999",
+            "claimant_name": "Test Farmer",
+            "crop_type": "Soybean",
+            "claimed_cause": "Inundation / Flood",
+            "incident_date": "2026-08-15"
+        }
+        res = fieldmod.assess_field(
+            mini_cfg, geom, "demo", root=tmp,
+            claim_info=claim_info,
+            unexpected_param_1="foo",
+            unexpected_param_2=123
+        )
+        assert res is not None
+        assert res["claim_info"]["claim_ref"] == "CLM-2026-TEST"
+        assert os.path.exists(res["pdf"])
+        assert os.path.exists(res["geojson"])
+
+
+def test_incident_date_and_observation_window_consistency():
+    """Verify incident date, observation window, and acquisition dates agree across artifacts."""
+    with tempfile.TemporaryDirectory() as tmp:
+        mini_cfg = copy.deepcopy(CFG)
+        procdir = os.path.join(tmp, "proc_test")
+        geom = box(74.645, 19.385, 74.655, 19.395)
+        claimed_date = "2025-08-15"
+        peril = "Flood"
+
+        discovery, meta = incidentmod.fetch_incident_demo(
+            mini_cfg, geom, incident_date=claimed_date, procdir=procdir, peril=peril
+        )
+        # 1. Claimed date must NOT be mutated or replaced
+        assert discovery["incident_date"] == claimed_date
+        assert meta["incident_date"] == claimed_date
+
+        # 2. Observation window must be present and match pre/post dates
+        pre_d = discovery["selected_pre"]["date"]
+        post_d = discovery["selected_post"]["date"]
+        assert meta["event_window"] == [pre_d, post_d]
+
+        # 3. assess_field must record these in metrics
+        claim_info = {"claimed_cause": peril, "incident_date": claimed_date}
+        res = fieldmod.assess_field(
+            mini_cfg, geom, "demo", root=tmp, rasters_dir=procdir, meta=meta, claim_info=claim_info
+        )
+        m = res["metrics"]
+        assert m["incident_date"] == claimed_date
+        assert m["event_window"] == [pre_d, post_d]
+
+        # 4. save_assessment and load_active_assessment must preserve them
+        run_data = {
+            "run_id": res["run_id"],
+            "param_key": res["param_key"],
+            "mode": "demo",
+            "workflow_mode": "historical",
+            "incident_date": claimed_date,
+            "claimed_peril": peril,
+            "event_window": [pre_d, post_d],
+            "baseline_years": [2022, 2023],
+            "discovery": discovery,
+            "geom_wkt": geom.wkt,
+            "res": res,
+            "claim_info": claim_info,
+        }
+        saved_dir = os.path.join(tmp, "saved")
+        save_path = save_assessment(run_data, saved_dir=saved_dir)
+        assert os.path.exists(save_path)
+
+        loaded = load_active_assessment(res["run_id"], saved_dir=saved_dir)
+        assert loaded is not None
+        assert loaded["incident_date"] == claimed_date
+        assert loaded["event_window"] == [pre_d, post_d]
+
+
+def test_damage_calculation_denominators_and_metrics():
+    """Verify damage calculations: pixel counts, denominators, affected %, and severity."""
+    mean, std, ndvi_arr, ndwi_arr = _arrays_for_field()
+    # Mask half the pixels as invalid
+    ndvi_arr[10:, :] = -9999.0
+    area_ha_val = 4.0
+    n_field_px = 400
+
+    m = score_arrays(
+        mask_nodata(ndvi_arr), mask_nodata(ndwi_arr),
+        mask_nodata(mean), mask_nodata(std), CFG,
+        area_ha_=area_ha_val, n_field_pixels=n_field_px
+    )
+
+    # 1. Denominators: valid_pct denominator is n_field_pixels
+    assert m["n_field_pixels"] == 400
+    assert m["n_valid_pixels"] == 200
+    assert m["valid_pct"] == 50.0
+
+    # 2. Affected % denominator is n_valid_pixels
+    assert m["affected_pct"] == pytest.approx(18.0)
+    # 3. Estimated affected area is proportional to total field area
+    expected_ha = round((m["affected_pct"] / 100.0) * area_ha_val, 3)
+    assert m["affected_area_ha"] == pytest.approx(expected_ha)
+    # 4. Severity classification aligns with thresholds
+    assert m["severity"] == "moderate"  # 18% is between 15% and 35%
+
+
+def test_field_report_with_claim_info_and_peril_checklist():
+    """Verify build_field_report generates complete PDF with claim info and checklists."""
+    with tempfile.TemporaryDirectory() as tmp:
+        mini_cfg = copy.deepcopy(CFG)
+        procdir = os.path.join(tmp, "proc")
+        geom = box(74.645, 19.385, 74.655, 19.395)
+        claim_info = {
+            "claim_ref": "CLM-2026-AUDIT",
+            "policy_no": "POL-MH-7711",
+            "claimant_name": "Suresh Kale",
+            "crop_type": "Cotton",
+            "claimed_cause": "Inundation / Flood",
+            "incident_date": "2025-08-15"
+        }
+        discovery, meta = incidentmod.fetch_incident_demo(
+            mini_cfg, geom, incident_date="2025-08-15", procdir=procdir, peril="Inundation / Flood"
+        )
+        res = fieldmod.assess_field(
+            mini_cfg, geom, "demo", root=tmp, rasters_dir=procdir, meta=meta, claim_info=claim_info
+        )
+        pdf_path = res["pdf"]
+        assert os.path.exists(pdf_path)
+        assert os.path.getsize(pdf_path) > 10000  # Non-trivial valid PDF
+
+
+def test_map_safe_geodataframe_serializes_timestamps_to_folium():
+    """Verify that GeoDataFrames containing pd.Timestamp columns (such as incident_date)
+    are properly sanitized by map_safe_geodataframe and render in folium.GeoJson without error."""
+    import folium
+    import pandas as pd
+    import geopandas as gpd
+
+    gdf = gpd.GeoDataFrame({
+        "cell_id": [101],
+        "incident_date": [pd.Timestamp("2026-10-26 12:00:00")],
+        "event_window": [np.array(["2026-10-20", "2026-10-25"])],
+        "affected_pct": [12.5],
+        "severity": ["low"],
+    }, geometry=[box(74.6, 19.3, 74.7, 19.4)], crs="EPSG:4326")
+
+    safe_gdf = fieldmod.map_safe_geodataframe(gdf)
+    assert isinstance(safe_gdf.iloc[0]["incident_date"], str)
+    assert safe_gdf.iloc[0]["incident_date"].startswith("2026-10-26")
+
+    # folium.GeoJson uses json.dumps(data.__geo_interface__) which previously crashed
+    geojson_layer = folium.GeoJson(safe_gdf)
+    assert geojson_layer is not None
 
 
 if __name__ == "__main__":

@@ -334,7 +334,7 @@ if st.sidebar.button("🚀 Run before-and-after assessment",
                         "workflow_mode": workflow_mode,
                         "incident_date": inc_str,
                         "claimed_peril": claimed_peril,
-                        "event_window": eff.get("event_window"),
+                        "event_window": meta.get("event_window") or eff.get("event_window"),
                         "baseline_years": eff["baseline_years"],
                         "discovery": discovery,
                         "geom_wkt": geom.wkt,
@@ -505,29 +505,35 @@ with tab_assess:
         grid_geojson = os.path.join(res.get("outdir", ""), "damage.geojson")
         if os.path.exists(grid_geojson):
             fg_grid = folium.FeatureGroup(name="③ Regional screening grid (~300m cells)", show=False)
-            gdf_ = map_safe_geodataframe(gpd.read_file(grid_geojson))
-            def style_grid(feat):
-                s = feat["properties"].get("severity", "none")
-                col = COLORS.get(s, "#888888")
-                return {"fillColor": col, "color": col, "weight": 1, "fillOpacity": 0.4}
-            folium.GeoJson(
-                gdf_, style_function=style_grid,
-                tooltip=folium.GeoJsonTooltip(fields=["cell_id", "affected_pct", "severity", "cause"],
-                                              aliases=["Cell", "Stress %", "Level", "Cause"])
-            ).add_to(fg_grid)
-            fg_grid.add_to(m)
+            try:
+                gdf_ = map_safe_geodataframe(gpd.read_file(grid_geojson))
+                def style_grid(feat):
+                    s = feat["properties"].get("severity", "none")
+                    col = COLORS.get(s, "#888888")
+                    return {"fillColor": col, "color": col, "weight": 1, "fillOpacity": 0.4}
+                folium.GeoJson(
+                    gdf_, style_function=style_grid,
+                    tooltip=folium.GeoJsonTooltip(fields=["cell_id", "affected_pct", "severity", "cause"],
+                                                  aliases=["Cell", "Stress %", "Level", "Cause"])
+                ).add_to(fg_grid)
+                fg_grid.add_to(m)
+            except Exception as e:
+                st.caption(f"ℹ️ Regional grid map layer omitted: {e}")
 
         fg_field = folium.FeatureGroup(name="④ Areas flagged for possible crop stress", show=True)
         if os.path.exists(res.get("geojson", "")):
-            fgf = map_safe_geodataframe(gpd.read_file(res["geojson"]),
-                                        drop_columns=("geometry_wkt", "param_key"))
-            if not fgf.empty:
-                folium.GeoJson(
-                    fgf,
-                    style_function=lambda f: {"fillColor": "#C22D2D", "color": "#7F1D1D", "weight": 3, "fillOpacity": 0.25},
-                    tooltip="Assessed Field Screening Result"
-                ).add_to(fg_field)
-                fg_field.add_to(m)
+            try:
+                fgf = map_safe_geodataframe(gpd.read_file(res["geojson"]),
+                                            drop_columns=("geometry_wkt", "param_key"))
+                if not fgf.empty:
+                    folium.GeoJson(
+                        fgf,
+                        style_function=lambda f: {"fillColor": "#C22D2D", "color": "#7F1D1D", "weight": 3, "fillOpacity": 0.25},
+                        tooltip="Assessed Field Screening Result"
+                    ).add_to(fg_field)
+                    fg_field.add_to(m)
+            except Exception as e:
+                st.caption(f"ℹ️ Field boundary layer omitted: {e}")
 
     Draw(export=False, draw_options={
         "polyline": False, "polygon": True, "rectangle": True,
@@ -874,6 +880,11 @@ with tab_compare:
             m = rec.get("metrics", {})
             a_ha = m.get("area_ha", "?")
             a_ac = round(a_ha * HA_TO_ACRES, 2) if isinstance(a_ha, (int, float)) else "?"
+            win = rec.get("event_window")
+            if isinstance(win, (list, tuple)) and len(win) == 2:
+                win_disp = f"{win[0]} → {win[1]}"
+            else:
+                win_disp = str(win or "N/A")
             table_rows.append({
                 "Run ID": rec["run_id"],
                 "Mode": rec.get("mode", "?").upper(),
@@ -882,7 +893,7 @@ with tab_compare:
                 "Screening level": m.get("severity", "?").capitalize(),
                 "Possible cause": m.get("cause", "?").capitalize(),
                 "Usable data": f"{m.get('valid_pct', '?')}%",
-                "Observation window": str(rec.get("event_window", "?")),
+                "Observation window": win_disp,
             })
         st.dataframe(pd.DataFrame(table_rows), hide_index=True, width="stretch")
 
@@ -949,6 +960,8 @@ with tab_compare:
                     r_rec = load_saved_assessment(rid)
                     if not r_rec: continue
                     rm = r_rec.get("metrics", {})
+                    cw = r_rec.get("event_window")
+                    cw_disp = f"{cw[0]} → {cw[1]}" if isinstance(cw, (list, tuple)) and len(cw) == 2 else str(cw or "N/A")
                     comp_rows.append({
                         "Run ID": rid,
                         "Mode": r_rec.get("mode", "?").upper(),
@@ -960,7 +973,7 @@ with tab_compare:
                         "Usable data %": rm.get("valid_pct", "?"),
                         "NDVI Δ": rm.get("ndvi_delta", "?"),
                         "z-score": rm.get("z_score", "?"),
-                        "Window": str(r_rec.get("event_window", "?")),
+                        "Window": cw_disp,
                     })
                     curr_win = str(r_rec.get("event_window"))
                     curr_mode = str(r_rec.get("mode"))

@@ -115,9 +115,23 @@ def area_ha(geom):
 def geojson_safe_value(value):
     """Recursively convert a property value to JSON-compatible form:
     numpy arrays -> lists, numpy scalars -> native Python values,
-    tuple -> list, dict recursed, non-finite floats -> None."""
-    if value is None or isinstance(value, (bool, str)):
+    tuple -> list, dict recursed, non-finite floats -> None,
+    timestamps/dates -> ISO strings."""
+    if value is None:
+        return None
+    try:
+        import pandas as pd
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, (bool, str)):
         return value
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
     if isinstance(value, dict):
         return {str(k): geojson_safe_value(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, np.ndarray)):
@@ -128,7 +142,7 @@ def geojson_safe_value(value):
         return value
     if isinstance(value, (int, float)):
         return None if not math.isfinite(value) else value
-    return value
+    return str(value)
 
 
 def map_safe_geodataframe(gdf, drop_columns=()):
@@ -139,10 +153,11 @@ def map_safe_geodataframe(gdf, drop_columns=()):
     drop = [c for c in drop_columns if c in out.columns]
     if drop:
         out = out.drop(columns=drop)
+    import pandas as pd
     for col in out.columns:
         if col == out.geometry.name:
             continue
-        out[col] = out[col].apply(geojson_safe_value).astype(object)
+        out[col] = pd.Series([geojson_safe_value(v) for v in out[col]], index=out.index, dtype=object)
     return out
 
 
@@ -239,7 +254,9 @@ def evidence_state(metrics, cfg):
     """
     if sufficiency_flag(metrics["valid_pct"], cfg):
         return "insufficient"
-    if metrics["cause"] == "none" and metrics["affected_pct"] < 0.5:
+    if metrics.get("cause") == "none" and metrics.get("affected_pct", 0) < 0.5:
+        return "no_evidence"
+    if metrics.get("affected_pct", 0) < 0.5 and metrics.get("severity") == "none":
         return "no_evidence"
     return "assessed"
 
@@ -378,7 +395,7 @@ def make_field_quicklook(mean_m, ndvi_m, affected, out_path, meta=None):
 # End-to-end assessment of the exact selected geometry
 # --------------------------------------------------------------------------- #
 def assess_field(cfg, geom, mode, root=ROOT, run_id=None, rasters_dir=None,
-                 meta=None, seed=None, claim_info=None):
+                 meta=None, seed=None, claim_info=None, **kwargs):
     """Run the full field workflow for the SELECTED geometry.
 
     - mode: 'live' (Earth Engine, cached) | 'demo' (deterministic
@@ -430,9 +447,21 @@ def assess_field(cfg, geom, mode, root=ROOT, run_id=None, rasters_dir=None,
                                  round(geom.centroid.x, 6)]
     metrics["claim_info"] = claim_info or {}
     metrics["workflow"] = meta.get("workflow", "baseline_composite")
-    metrics["param_key"] = param_key(
-        mode, geom.wkt, cfg.get("event_window", ["none", "none"]),
-        cfg.get("baseline_years", []), canonical_settings(cfg))
+    metrics["event_window"] = meta.get("event_window") or cfg.get("event_window")
+    metrics["incident_date"] = (claim_info or {}).get("incident_date") or meta.get("incident_date")
+    metrics["search_window"] = meta.get("search_window") or cfg.get("search_window")
+
+    if meta.get("workflow") == "incident_comparison":
+        inc_str = str(metrics["incident_date"] or "none")
+        wf_mode = (claim_info or {}).get("workflow_mode") or meta.get("workflow_mode", "historical")
+        c_peril_str = c_peril or "General"
+        metrics["param_key"] = param_key(
+            mode, geom.wkt, [inc_str, wf_mode, c_peril_str],
+            cfg.get("baseline_years", []), canonical_settings(cfg))
+    else:
+        metrics["param_key"] = param_key(
+            mode, geom.wkt, cfg.get("event_window", ["none", "none"]),
+            cfg.get("baseline_years", []), canonical_settings(cfg))
 
     # evidence: distinguish "no evidence" from "not enough data"
     state = evidence_state(metrics, cfg)
@@ -502,12 +531,28 @@ def main():
     ap.add_argument("--live", action="store_true",
                     help="query Earth Engine for the boundary (requires "
                          "auth); default is demo mode")
+    ap.add_argument("--claim-ref", default=None, help="Insurance claim reference number")
+    ap.add_argument("--policy-no", default=None, help="Policy number")
+    ap.add_argument("--claimant-name", default=None, help="Claimant / insured name")
+    ap.add_argument("--crop-type", default=None, help="Insured crop type")
+    ap.add_argument("--peril", default=None, help="Claimed peril / cause")
+    ap.add_argument("--incident-date", default=None, help="Claimed incident date (YYYY-MM-DD)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
     geom = geometry_from_inputs(coords=args.coords, geojson_path=args.geojson)
     mode = "live" if args.live else "demo"
-    res = assess_field(cfg, geom, mode)
+    claim_info = None
+    if any([args.claim_ref, args.policy_no, args.claimant_name, args.crop_type, args.peril, args.incident_date]):
+        claim_info = {
+            "claim_ref": args.claim_ref or "Not provided",
+            "policy_no": args.policy_no or "Not provided",
+            "claimant_name": args.claimant_name or "Not provided",
+            "crop_type": args.crop_type or "Not specified",
+            "claimed_cause": args.peril or "General Crop Stress",
+            "incident_date": args.incident_date,
+        }
+    res = assess_field(cfg, geom, mode, claim_info=claim_info)
     m = res["metrics"]
     print(f"\nField assessment ({mode}) run {res['run_id']}")
     print(f"  geometry       : {geom.wkt[:80]}…")
