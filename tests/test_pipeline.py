@@ -1220,5 +1220,67 @@ def test_storage_save_and_load_claim_info(tmp_path):
     assert loaded["metrics"]["area_ha"] == 5.0
 
 
+def test_classify_cause_with_peril():
+    """Verify classify_cause custom tailoring for flood, drought, hail, and unknown."""
+    # 1. Flood: elevated NDWI (0.08 > 1.5 * 0.05 -> low uncertainty)
+    c_flood, u_flood = analyze.classify_cause(0.25, 0.08, -0.20, 0.05, claimed_peril="Inundation / Flood")
+    assert c_flood == "flood"
+    assert u_flood == "low"
+
+    # 2. Drought: persistent negative NDVI with dry NDWI
+    c_drought, u_drought = analyze.classify_cause(0.30, -0.05, -0.22, 0.05, claimed_peril="Drought / Dry Spell")
+    assert c_drought == "drought"
+    assert u_drought == "low"
+
+    # 3. Hail: acute drop reported as hail
+    c_hail, u_hail = analyze.classify_cause(0.20, -0.02, -0.18, 0.05, claimed_peril="Other / Hail")
+    assert c_hail == "hail_suspected"
+    assert u_hail == "high"
+
+    # 4. Unknown: moderate anomaly without distinct moisture or dryness signal
+    c_unk, u_unk = analyze.classify_cause(0.12, 0.01, -0.08, 0.05, claimed_peril="General Crop Stress")
+    assert c_unk == "unknown"
+
+
+def test_incident_demo_before_after_comparison(tmp_path):
+    """Verify that fetch_incident_demo generates aligned pre and post incident rasters and report."""
+    from incident import fetch_incident_demo
+    import field as fieldmod
+
+    geom = box(74.63, 19.37, 74.67, 19.41)
+    procdir = str(tmp_path / "incident_demo")
+    disc, meta = fetch_incident_demo(CFG, geom, "2025-08-15", procdir, peril="Flood")
+
+    assert disc["data_sufficiency"] == "sufficient"
+    assert disc["selected_pre"] is not None
+    assert disc["selected_post"] is not None
+    assert meta["workflow"] == "incident_comparison"
+
+    # Verify rasters exist
+    for r in ["pre_ndvi.tif", "post_ndvi.tif", "baseline_mean.tif", "event_ndvi.tif"]:
+        assert os.path.exists(os.path.join(procdir, r))
+
+    # Run assess_field on this directory
+    claim_info = {
+        "claim_ref": "CLM-INCIDENT-DEMO",
+        "policy_no": "POL-INCIDENT-999",
+        "claimant_name": "Ramesh Patil",
+        "crop_type": "Soybean",
+        "claimed_cause": "Inundation / Flood",
+        "incident_date": "2025-08-15",
+    }
+    run_id = "run_inc_demo_test"
+    res = fieldmod.assess_field(
+        CFG, geom, "demo", root=str(tmp_path), run_id=run_id,
+        rasters_dir=procdir, meta=meta, claim_info=claim_info
+    )
+
+    assert res["run_id"] == run_id
+    assert res["metrics"]["workflow"] == "incident_comparison"
+    assert res["metrics"]["area_ha"] > 0
+    assert os.path.exists(res["pdf"])
+    assert os.path.exists(res["quicklook"])
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

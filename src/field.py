@@ -159,7 +159,7 @@ def _as_masked(a):
     return np.ma.masked_where(mask, a)
 
 
-def score_arrays(ndvi_m, ndwi_m, mean_m, std_m, cfg, area_ha_, n_field_pixels=None):
+def score_arrays(ndvi_m, ndwi_m, mean_m, std_m, cfg, area_ha_, n_field_pixels=None, claimed_peril=None):
     """Field-level metrics from masked arrays. Measured vs heuristic kept
     separate. Denominators: affected_pct uses VALID pixels; valid_pct uses
     pixels of the field geometry."""
@@ -205,7 +205,8 @@ def score_arrays(ndvi_m, ndwi_m, mean_m, std_m, cfg, area_ha_, n_field_pixels=No
 
     severity = classify_severity(frac, cfg["severity"])
     cause, uncertainty = classify_cause(frac, ndwi_mean_c, delta,
-                                        cfg["ndwi_flood_threshold"])
+                                        cfg["ndwi_flood_threshold"],
+                                        claimed_peril=claimed_peril)
 
     return {
         "area_ha": round(area_ha_, 3),
@@ -314,7 +315,7 @@ def read_field_rasters(paths, geom=None):
     }
 
 
-def make_field_quicklook(mean_m, ndvi_m, affected, out_path):
+def make_field_quicklook(mean_m, ndvi_m, affected, out_path, meta=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -324,23 +325,38 @@ def make_field_quicklook(mean_m, ndvi_m, affected, out_path):
     cmap_veg = plt.cm.YlGn.with_extremes(bad="#EBEBEB")
     cmap_aff = plt.cm.YlOrRd.with_extremes(bad="#EBEBEB")
 
-    # Panel 1: Historical Baseline Norm
+    is_incident = (meta or {}).get("workflow") == "incident_comparison"
+    pre_date = (meta or {}).get("pre_scene", {}).get("date", "Pre-Incident")
+    post_date = (meta or {}).get("post_scene", {}).get("date", "Post-Incident")
+
+    if is_incident:
+        title0 = f"Pre-Incident Observation\n({pre_date} Sentinel-2 NDVI)"
+        title1 = f"Post-Incident Observation\n({post_date} Sentinel-2 NDVI)"
+        label_bar0 = "Pre-Incident NDVI"
+        label_bar1 = "Post-Incident NDVI"
+        main_title = f"Incident Before-and-After Evidence — Sentinel-2 Crop Damage Analysis ({meta.get('peril', 'Claimed Peril')})"
+    else:
+        title0 = "Historical Baseline Norm\n(Healthy Multi-Year Baseline NDVI)"
+        title1 = "Claim Observation Period\n(Observed Sentinel-2 NDVI)"
+        label_bar0 = "NDVI (Greener = healthier norm)"
+        label_bar1 = "Observed NDVI"
+        main_title = "Satellite Field Evidence — Sentinel-2 Crop Damage Screening (Grey = clouds, shadow, or outside boundary)"
+
+    # Panel 1: Pre-Incident / Baseline
     im0 = axes[0].imshow(mean_m, cmap=cmap_veg, vmin=0.05, vmax=0.8)
-    axes[0].set_title("Historical Baseline Norm\n(Healthy Multi-Year Baseline NDVI)",
-                      fontsize=11, fontweight="bold", pad=8)
+    axes[0].set_title(title0, fontsize=11, fontweight="bold", pad=8)
     axes[0].set_xticks([])
     axes[0].set_yticks([])
     cbar0 = plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
-    cbar0.set_label("NDVI (Greener = healthier norm)", fontsize=9)
+    cbar0.set_label(label_bar0, fontsize=9)
 
-    # Panel 2: Claim Observation Period
+    # Panel 2: Post-Incident / Observed
     im1 = axes[1].imshow(ndvi_m, cmap=cmap_veg, vmin=0.05, vmax=0.8)
-    axes[1].set_title("Claim Observation Period\n(Observed Sentinel-2 NDVI)",
-                      fontsize=11, fontweight="bold", pad=8)
+    axes[1].set_title(title1, fontsize=11, fontweight="bold", pad=8)
     axes[1].set_xticks([])
     axes[1].set_yticks([])
     cbar1 = plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
-    cbar1.set_label("Observed NDVI", fontsize=9)
+    cbar1.set_label(label_bar1, fontsize=9)
 
     # Panel 3: Damage Screening Indicator
     im2 = axes[2].imshow(affected.astype(float), cmap=cmap_aff, vmin=0, vmax=1)
@@ -351,8 +367,7 @@ def make_field_quicklook(mean_m, ndvi_m, affected, out_path):
     cbar2 = plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04, ticks=[0, 1])
     cbar2.ax.set_yticklabels(["Normal / No stress", "Flagged stress"])
 
-    fig.suptitle("Satellite Field Evidence — Sentinel-2 Crop Damage Screening (Grey = clouds, shadow, or outside boundary)",
-                 fontsize=10, y=0.98, color="#444444")
+    fig.suptitle(main_title, fontsize=10, y=0.98, color="#444444")
     plt.tight_layout(rect=(0, 0, 1, 0.94))
     plt.savefig(out_path, dpi=120)
     plt.close(fig)
@@ -374,7 +389,7 @@ def assess_field(cfg, geom, mode, root=ROOT, run_id=None, rasters_dir=None,
     """
     geom = validate_geometry(geom)
     run_id = run_id or new_run_id()
-    data_dir = os.path.join(root, cfg["data_dir"])
+    data_dir = os.path.join(root, cfg.get("data_dir", "data"))
 
     if rasters_dir is None:
         meta, procdir = prepare_rasters(cfg, geom, mode, root, run_id,
@@ -402,9 +417,11 @@ def assess_field(cfg, geom, mode, root=ROOT, run_id=None, rasters_dir=None,
 
     arrays = read_field_rasters(paths, geom=geom)
     ha = area_ha(geom)
+    c_peril = (claim_info or {}).get("claimed_cause") or meta.get("peril")
     metrics = score_arrays(arrays["ndvi"], arrays["ndwi"],
                            arrays["mean"], arrays["std"], cfg, ha,
-                           n_field_pixels=arrays.get("n_field_pixels"))
+                           n_field_pixels=arrays.get("n_field_pixels"),
+                           claimed_peril=c_peril)
     metrics["mode"] = mode
     metrics["run_id"] = run_id
     metrics["geometry_wkt"] = geom.wkt
@@ -412,9 +429,10 @@ def assess_field(cfg, geom, mode, root=ROOT, run_id=None, rasters_dir=None,
     metrics["centroid_wgs84"] = [round(geom.centroid.y, 6),
                                  round(geom.centroid.x, 6)]
     metrics["claim_info"] = claim_info or {}
+    metrics["workflow"] = meta.get("workflow", "baseline_composite")
     metrics["param_key"] = param_key(
-        mode, geom.wkt, cfg["event_window"], cfg["baseline_years"],
-        canonical_settings(cfg))
+        mode, geom.wkt, cfg.get("event_window", ["none", "none"]),
+        cfg.get("baseline_years", []), canonical_settings(cfg))
 
     # evidence: distinguish "no evidence" from "not enough data"
     state = evidence_state(metrics, cfg)
@@ -433,7 +451,7 @@ def assess_field(cfg, geom, mode, root=ROOT, run_id=None, rasters_dir=None,
 
     # outputs (all inside this run's directory — stale outputs can't be
     # confused with a new run)
-    outdir = os.path.join(root, cfg["out_dir"], run_id)
+    outdir = os.path.join(root, cfg.get("out_dir", "data/outputs"), run_id)
     os.makedirs(outdir, exist_ok=True)
 
     geometry_props = {k: geojson_safe_value(v) for k, v in metrics.items()}
@@ -452,7 +470,7 @@ def assess_field(cfg, geom, mode, root=ROOT, run_id=None, rasters_dir=None,
     affected = ((z < -abs(cfg["ndvi_z_threshold"]))
                 & (arrays["ndvi"] < arrays["mean"]))
     quicklook = os.path.join(outdir, "field_quicklook.png")
-    make_field_quicklook(arrays["mean"], arrays["ndvi"], affected, quicklook)
+    make_field_quicklook(arrays["mean"], arrays["ndvi"], affected, quicklook, meta=meta)
 
     import report
     pdf_dir = os.path.join(root, cfg.get("report_dir", "reports"), run_id)

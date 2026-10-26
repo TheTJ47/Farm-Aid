@@ -82,16 +82,29 @@ def classify_severity(frac, cut):
     return "none"
 
 
-def classify_cause(affected_frac, ndwi_mean, ndvi_delta, flood_thr):
-    """Provisional cause: flood (anomaly + water signal), drought (strong
-    anomaly + context), unknown (inconclusive). Hail is NOT supported and
-    is never returned — suspects fall to 'unknown'."""
+def classify_cause(affected_frac, ndwi_mean, ndvi_delta, flood_thr, claimed_peril=None):
+    """Provisional cause evaluation tailored to reported peril and spectral signatures.
+    - Flood / Inundation: Flagged anomaly + elevated water/moisture signal (NDWI > flood_thr).
+    - Drought / Dryness: Flagged anomaly + persistent canopy dry-down (ΔNDVI < -0.15) with dry NDWI.
+    - Hail: Optical multispectral sensors can observe acute defoliation/scarring between adjacent clear passes,
+      but cannot confirm hail impact without radar trajectory data. If claimed and acute drop observed, returns
+      'hail_suspected (radar verification required)', else 'unknown'.
+    - Unknown: When spectral evidence does not clearly distinguish between abiotic stress, disease, or management.
+    """
     if affected_frac <= 0:
         return "none", "low"
+
+    peril_str = str(claimed_peril or "").lower()
+
     if ndwi_mean > flood_thr:
         uncertainty = "low" if ndwi_mean > 1.5 * flood_thr else "medium"
         return "flood", uncertainty
+    if "hail" in peril_str and ndvi_delta < -0.10:
+        # Acute loss reported as hail: note that satellite indicates physical damage but hail cannot be proved by NDVI alone
+        return "hail_suspected", "high"
     if ndvi_delta < -0.15:
+        if "drought" in peril_str or "dry" in peril_str:
+            return "drought", "low"
         return "drought", "medium"
     return "unknown", "high"
 

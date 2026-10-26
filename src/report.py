@@ -682,15 +682,30 @@ def build_field_report(cfg, metrics, meta, quicklook_path, out_path, claim_info=
     story.append(Spacer(1, 2.5 * mm))
 
     # Executive Summary Key Metrics Grid
+    is_incident = meta.get("workflow") == "incident_comparison"
+    pre_scene = meta.get("pre_scene", {})
+    post_scene = meta.get("post_scene", {})
+
+    if is_incident:
+        obs_timeline = f"Pre: {pre_scene.get('date', '?')} → Post: {post_scene.get('date', '?')}"
+        norm_label = "Pre-Incident Reference Observation"
+        norm_val = f"{pre_scene.get('date', '?')} ({abs(pre_scene.get('days_from_incident', 0))}d before incident on {meta.get('incident_date')})"
+    else:
+        obs_timeline = f"{meta.get('event_window', ['?','?'])[0]} → {meta.get('event_window', ['?','?'])[1]}"
+        norm_label = "Historical Healthy Baseline"
+        norm_val = f"{report_baseline_years(meta)} ({meta.get('baseline_window', ['?','?'])[0]} → {meta.get('baseline_window', ['?','?'])[1]})"
+
     sum_data = [
         [Paragraph("<b>Metric / Parameter</b>", table_head), Paragraph("<b>Claimed Assessment Value</b>", table_head),
          Paragraph("<b>Insurance Assessor Interpretation</b>", table_head)],
         [Paragraph("Field Total Area", table_bold), Paragraph(f"{area_ha} ha (~{area_ac} acres)", table_text),
          Paragraph("Planar UTM area of the user-delineated parcel boundary", table_text)],
-        [Paragraph("Observation Window", table_bold), Paragraph(f"{meta.get('event_window', ['?','?'])[0]} → {meta.get('event_window', ['?','?'])[1]}", table_text),
-         Paragraph("Claimed loss observation timeline assessed via Sentinel-2", table_text)],
-        [Paragraph("Historical Healthy Baseline", table_bold), Paragraph(f"{report_baseline_years(meta)} ({meta.get('baseline_window', ['?','?'])[0]} → {meta.get('baseline_window', ['?','?'])[1]})", table_text),
-         Paragraph("Multi-year same-calendar reference norm", table_text)],
+        [Paragraph("Assessment Workflow", table_bold), Paragraph("Incident Before/After Comparison" if is_incident else "Multi-Year Baseline Screening", table_bold),
+         Paragraph("Direct pre- vs post-event satellite observation comparison" if is_incident else "Multi-year historical healthy baseline comparison", table_text)],
+        [Paragraph("Observation Timeline", table_bold), Paragraph(obs_timeline, table_text),
+         Paragraph("Exact Sentinel-2 acquisition dates evaluated", table_text)],
+        [Paragraph(norm_label, table_bold), Paragraph(norm_val, table_text),
+         Paragraph("Reference baseline used to evaluate vegetation change", table_text)],
         [Paragraph("Usable Satellite Coverage", table_bold), Paragraph(f"{valid_cov}% ({metrics.get('n_valid_pixels', 0)} / {metrics.get('n_field_pixels', 0)} pixels)", table_text),
          Paragraph("Field pixels with clear cloud-free observations", table_text)],
         [Paragraph("Estimated Affected Area", table_bold), Paragraph(f"{aff_ha} ha (~{aff_ac} acres)", table_bold),
@@ -729,10 +744,10 @@ def build_field_report(cfg, metrics, meta, quicklook_path, out_path, claim_info=
          Paragraph(f"UTM Projected CRS: {meta.get('crs', 'EPSG:32643')} @ 10m native scale", table_text)],
         [Paragraph("Parcel Coordinates", table_bold), Paragraph(f"Centroid: {metrics.get('centroid_wgs84', ['?','?'])[0]}°N, {metrics.get('centroid_wgs84', ['?','?'])[1]}°E", table_text),
          Paragraph(f"BBox: {metrics.get('bounds_wgs84', ['?','?','?','?'])}", table_text)],
-        [Paragraph("Claim Timeline", table_bold), Paragraph(f"Obs Window: {meta.get('event_window')}", table_text),
-         Paragraph(f"Calendar window evaluated across Sentinel-2 orbit cycles", table_text)],
-        [Paragraph("Baseline Composition", table_bold), Paragraph(f"Requested years: {meta.get('baseline_years')}", table_text),
-         Paragraph(f"Successfully processed: {report_baseline_years(meta)}", table_text)],
+        [Paragraph("Claimed Incident Date", table_bold), Paragraph(str(meta.get("incident_date", "Not specified")), table_text),
+         Paragraph(f"Comparison: Pre-event {pre_scene.get('date', '?')} vs Post-event {post_scene.get('date', '?')}" if is_incident else f"Obs Window: {meta.get('event_window')}", table_text)],
+        [Paragraph("Baseline Composition", table_bold), Paragraph(f"Direct Pre-event Observation" if is_incident else f"Requested years: {meta.get('baseline_years')}", table_text),
+         Paragraph(f"Pre-incident Sentinel-2 scene ({pre_scene.get('id', 'N/A')[:25]}...)" if is_incident else f"Successfully processed: {report_baseline_years(meta)}", table_text)],
     ]
     if meta.get("skipped_baseline_years"):
         skipped_str = "; ".join(f"{y['year']}: {y.get('reason','')[:45]}" for y in meta["skipped_baseline_years"][:3])
@@ -768,22 +783,51 @@ def build_field_report(cfg, metrics, meta, quicklook_path, out_path, claim_info=
     story.append(Spacer(1, 1.5 * mm))
 
     if not meta.get("synthetic"):
-        acq_rows = [["Period / Year", "Scenes Used", "First Scene", "Last Scene", "Study AOI Clear %", "Field Boundary Clear %"]]
-        for p in meta.get("baseline_periods", []):
+        if is_incident:
+            acq_rows = [["Observation Role", "Scene Date", "Days from Incident", "Tile Cloud %", "Field Clear %", "Suitability"]]
+            if pre_scene:
+                acq_rows.append([
+                    "Pre-Incident Reference", str(pre_scene.get("date", "?")),
+                    f"{pre_scene.get('days_from_incident', '?')}d",
+                    f"{pre_scene.get('tile_cloud_pct', '?')}%",
+                    f"{pre_scene.get('field_clear_pct', '?')}%",
+                    "Suitable" if pre_scene.get("is_suitable") else "Cloud/Shadow Limited"
+                ])
+            if post_scene:
+                acq_rows.append([
+                    "Post-Incident Impact", str(post_scene.get("date", "?")),
+                    f"+{post_scene.get('days_from_incident', '?')}d",
+                    f"{post_scene.get('tile_cloud_pct', '?')}%",
+                    f"{post_scene.get('field_clear_pct', '?')}%",
+                    "Suitable" if post_scene.get("is_suitable") else "Cloud/Shadow Limited"
+                ])
+            # Additional trajectory scenes if present
+            for ts in meta.get("trajectory_post", [])[1:]:
+                acq_rows.append([
+                    "Post Trajectory (Follow-up)", str(ts.get("date", "?")),
+                    f"+{ts.get('days_from_incident', '?')}d",
+                    f"{ts.get('tile_cloud_pct', '?')}%",
+                    f"{ts.get('field_clear_pct', '?')}%",
+                    "Suitable"
+                ])
+            acq_t = Table(acq_rows, colWidths=[42 * mm, 26 * mm, 26 * mm, 26 * mm, 26 * mm, 36 * mm])
+        else:
+            acq_rows = [["Period / Year", "Scenes Used", "First Scene", "Last Scene", "Study AOI Clear %", "Field Boundary Clear %"]]
+            for p in meta.get("baseline_periods", []):
+                acq_rows.append([
+                    f"Baseline {p.get('year')}", str(p.get("images", "?")),
+                    str(p.get("first", "?"))[:10], str(p.get("last", "?"))[:10],
+                    f"{p.get('coverage_pct', '?')}%",
+                    f"{p.get('field_coverage_pct', p.get('coverage_pct', '?'))}%"
+                ])
+            ev = meta.get("event", {})
             acq_rows.append([
-                f"Baseline {p.get('year')}", str(p.get("images", "?")),
-                str(p.get("first", "?"))[:10], str(p.get("last", "?"))[:10],
-                f"{p.get('coverage_pct', '?')}%",
-                f"{p.get('field_coverage_pct', p.get('coverage_pct', '?'))}%"
+                "Claim Event Window", str(ev.get("images", "?")),
+                str(ev.get("first", "?"))[:10], str(ev.get("last", "?"))[:10],
+                f"{ev.get('coverage_pct', '?')}%",
+                f"{ev.get('field_coverage_pct', valid_cov)}%"
             ])
-        ev = meta.get("event", {})
-        acq_rows.append([
-            "Claim Event Window", str(ev.get("images", "?")),
-            str(ev.get("first", "?"))[:10], str(ev.get("last", "?"))[:10],
-            f"{ev.get('coverage_pct', '?')}%",
-            f"{ev.get('field_coverage_pct', valid_cov)}%"
-        ])
-        acq_t = Table(acq_rows, colWidths=[36 * mm, 24 * mm, 26 * mm, 26 * mm, 35 * mm, 35 * mm])
+            acq_t = Table(acq_rows, colWidths=[36 * mm, 24 * mm, 26 * mm, 26 * mm, 35 * mm, 35 * mm])
         acq_t.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2A4494")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
@@ -798,8 +842,8 @@ def build_field_report(cfg, metrics, meta, quicklook_path, out_path, claim_info=
         ]))
         story.append(acq_t)
         story.append(Paragraph(
-            "<i>Note on Spatial Divergence:</i> 'Study AOI Clear %' reflects clear observations across the broader ~4 km buffered region. "
-            "'Field Boundary Clear %' represents the parcel itself. Conclusive assessment requires >= 30% clear pixels across the field boundary.",
+            "<i>Note on Spatial Coverage:</i> Usable assessment requires >= 20% clear pixels across the field boundary. "
+            "Residual clouds and dense shadows are masked out and excluded from denominators.",
             ParagraphStyle("NoteIt", parent=small, fontSize=7, leading=9, textColor=colors.HexColor("#64748B"))))
         story.append(Spacer(1, 3.5 * mm))
 
@@ -811,19 +855,23 @@ def build_field_report(cfg, metrics, meta, quicklook_path, out_path, claim_info=
     if b_mean_val is None and metrics.get("ndvi_mean") is not None and metrics.get("ndvi_delta") is not None:
         b_mean_val = round(metrics["ndvi_mean"] - metrics["ndvi_delta"], 3)
 
+    obs_label = "Post-Incident NDVI Mean" if is_incident else "Observed NDVI Mean"
+    base_label = "Pre-Incident NDVI Mean" if is_incident else "Baseline NDVI Mean"
+    delta_label = "Incident Change (ΔNDVI)" if is_incident else "NDVI Change (ΔNDVI)"
+
     results_data = [
         [Paragraph("<b>Analytical Indicator</b>", table_head), Paragraph("<b>Observed Value</b>", table_head),
          Paragraph("<b>Unit</b>", table_head), Paragraph("<b>Plain-Language Definition</b>", table_head),
          Paragraph("<b>Insurance Assessor Interpretation</b>", table_head)],
-        [Paragraph("Observed NDVI Mean", table_bold), Paragraph(_val_or_na(metrics.get("ndvi_mean")), table_text),
-         Paragraph("Index [-1, 1]", table_text), Paragraph("Normalized Difference Vegetation Index during observation window", table_text),
-         Paragraph("Current crop canopy greenness and photosynthetic absorption", table_text)],
-        [Paragraph("Baseline NDVI Mean", table_bold), Paragraph(_val_or_na(b_mean_val), table_text),
-         Paragraph("Index [-1, 1]", table_text), Paragraph("Historical healthy vegetation norm for same calendar period", table_text),
-         Paragraph("Multi-year reference benchmark for expected healthy crops", table_text)],
-        [Paragraph("NDVI Change (ΔNDVI)", table_bold), Paragraph(_val_or_na(metrics.get("ndvi_delta")), table_bold),
-         Paragraph("Index Δ", table_text), Paragraph("Observed NDVI minus Historical Baseline NDVI (co-located pixels)", table_text),
-         Paragraph("Negative values indicate vegetative depression relative to normal", table_text)],
+        [Paragraph(obs_label, table_bold), Paragraph(_val_or_na(metrics.get("ndvi_mean")), table_text),
+         Paragraph("Index [-1, 1]", table_text), Paragraph("Sentinel-2 NDVI during post-incident observation", table_text) if is_incident else Paragraph("Normalized Difference Vegetation Index during observation window", table_text),
+         Paragraph("Post-event crop canopy greenness and photosynthetic vigour", table_text)],
+        [Paragraph(base_label, table_bold), Paragraph(_val_or_na(b_mean_val), table_text),
+         Paragraph("Index [-1, 1]", table_text), Paragraph("Sentinel-2 NDVI during pre-incident observation", table_text) if is_incident else Paragraph("Historical healthy vegetation norm for same calendar period", table_text),
+         Paragraph("Immediate pre-event canopy benchmark before reported peril" if is_incident else "Multi-year reference benchmark for expected healthy crops", table_text)],
+        [Paragraph(delta_label, table_bold), Paragraph(_val_or_na(metrics.get("ndvi_delta")), table_bold),
+         Paragraph("Index Δ", table_text), Paragraph("Post-incident minus Pre-incident NDVI (co-located pixels)" if is_incident else "Observed NDVI minus Historical Baseline NDVI (co-located pixels)", table_text),
+         Paragraph("Negative values indicate vegetative depression following the incident", table_text)],
         [Paragraph("Standardized Anomaly (z-score)", table_bold), Paragraph(_val_or_na(metrics.get("z_score"), fmt="{:.2f}"), table_bold),
          Paragraph("Std Devs (z)", table_text), Paragraph("(Observed − Baseline) / max(Historical Std, 0.02)", table_text),
          Paragraph("Statistical significance; z < -1.5 indicates anomalous stress", table_text)],
