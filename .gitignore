@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+
+# Private configuration and credentials
+config.yaml
+config.local.yaml
+.streamlit/secrets.toml
+credentials.json
+service-account*.json
+*.pem
+*.key
+
+# Local data and generated reports
+data/
+reports/
+farm-aid/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/

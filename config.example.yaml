@@ -1,0 +1,62 @@
+# FarmAid configuration TEMPLATE (config.example.yaml).
+#
+# The ZIP ships this template ONLY — your local config.yaml is never
+# touched, replaced or reset by extraction or by any code path. If
+# config.yaml is missing, the first run copies this template.
+#
+# NOTE: `aoi_center` is only the DEFAULT START LOCATION used until you
+# select a geometry. Every assessment builds its AOI from YOUR selection
+# (the selected geometry buffered by `aoi_buffer_km`).
+
+project: farm-aid
+
+# --- Default start location (NOT fixed study site) ---------------------------
+aoi_center: [19.39, 74.65]   # [lat, lon] — Rahuri, Maharashtra (start only)
+aoi_size_km: 8.0             # default AOI side when no geometry is given
+aoi_buffer_km: 2.0           # AOI = selected geometry + this buffer (km)
+
+# --- Dates (defaults; the dashboard overrides them per run) ------------------
+event_year: 2025
+event_window: ["2025-08-01", "2025-09-15"]
+baseline_years: [2021, 2022, 2023, 2024]
+baseline_window: ["08-01", "09-15"]
+
+# Window widening: 0 = strict (fail if the window has no usable imagery).
+# Setting N widens a window with no images by ±N days and RECORDS the
+# actual dates used. Nothing widens automatically without this setting.
+baseline_fallback_days: 0
+event_fallback_days: 0
+# Baseline years are attempted in order; years with no usable imagery are
+# skipped and recorded as long as this many usable years remain:
+min_baseline_years: 2
+# A period is "insufficient clear pixels" when post-masking coverage is
+# below this (a distinct data state from 'no imagery'):
+min_period_coverage_pct: 20
+
+# --- Google Earth Engine -----------------------------------------------------
+# Your local config.yaml holds your project id — kept as-is. The template
+# leaves it empty; set it only in YOUR config.yaml:
+gee_project: ""
+max_cloud_pct: 60
+
+# --- Analysis -----------------------------------------------------------------
+ndvi_z_threshold: 1.5
+ndwi_flood_threshold: 0.05
+grid_cell_size_m: 300        # analytical units, never farm parcels
+min_valid_pixels: 10
+min_valid_coverage_pct: 30   # below this, a field is "insufficient data"
+severity:                    # affected valid-pixel fraction (lower bounds)
+  low: 0.05
+  moderate: 0.15
+  high: 0.35
+
+# --- Paths -------------------------------------------------------------------
+data_dir: data
+out_dir: data/outputs
+report_dir: reports
+
+# --- Field assessment ---------------------------------------------------------
+field:
+  default_size_km: 1.0
+  hail_classification: unsupported  # documented decision — suspects return
+                                    # cause "unknown"
