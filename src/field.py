@@ -115,9 +115,23 @@ def area_ha(geom):
 def geojson_safe_value(value):
     """Recursively convert a property value to JSON-compatible form:
     numpy arrays -> lists, numpy scalars -> native Python values,
-    tuple -> list, dict recursed, non-finite floats -> None."""
-    if value is None or isinstance(value, (bool, str)):
+    tuple -> list, dict recursed, non-finite floats -> None,
+    timestamps/dates -> ISO strings."""
+    if value is None:
+        return None
+    try:
+        import pandas as pd
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, (bool, str)):
         return value
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
     if isinstance(value, dict):
         return {str(k): geojson_safe_value(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, np.ndarray)):
@@ -128,7 +142,7 @@ def geojson_safe_value(value):
         return value
     if isinstance(value, (int, float)):
         return None if not math.isfinite(value) else value
-    return value
+    return str(value)
 
 
 def map_safe_geodataframe(gdf, drop_columns=()):
@@ -139,10 +153,11 @@ def map_safe_geodataframe(gdf, drop_columns=()):
     drop = [c for c in drop_columns if c in out.columns]
     if drop:
         out = out.drop(columns=drop)
+    import pandas as pd
     for col in out.columns:
         if col == out.geometry.name:
             continue
-        out[col] = out[col].apply(geojson_safe_value).astype(object)
+        out[col] = pd.Series([geojson_safe_value(v) for v in out[col]], index=out.index, dtype=object)
     return out
 
 
@@ -159,7 +174,7 @@ def _as_masked(a):
     return np.ma.masked_where(mask, a)
 
 
-def score_arrays(ndvi_m, ndwi_m, mean_m, std_m, cfg, area_ha_, n_field_pixels=None):
+def score_arrays(ndvi_m, ndwi_m, mean_m, std_m, cfg, area_ha_, n_field_pixels=None, claimed_peril=None):
     """Field-level metrics from masked arrays. Measured vs heuristic kept
     separate. Denominators: affected_pct uses VALID pixels; valid_pct uses
     pixels of the field geometry."""
@@ -167,23 +182,46 @@ def score_arrays(ndvi_m, ndwi_m, mean_m, std_m, cfg, area_ha_, n_field_pixels=No
         _as_masked(a) for a in (ndvi_m, ndwi_m, mean_m, std_m))
     z = anomaly_z(ndvi_m, mean_m, std_m)
     threshold = -abs(cfg["ndvi_z_threshold"])
-    affected = (z < threshold) & (ndvi_m < mean_m)
 
+    # Co-located valid mask: pixels where both event NDVI and baseline (mean+std) are valid
+    valid_mask = ~np.ma.getmaskarray(z)
+    n_valid = int(np.count_nonzero(valid_mask))
     denom = n_field_pixels if n_field_pixels is not None else int(ndvi_m.size)
-    n_valid = int(z.count())
     valid_pct = 100.0 * n_valid / max(denom, 1)
-    frac = float(np.ma.mean(affected)) if affected.count() else 0.0
 
-    ndvi_mean_c = float(np.ma.mean(ndvi_m)) if ndvi_m.count() else np.nan
-    b_mean = float(np.ma.mean(mean_m)) if mean_m.count() else np.nan
-    delta = ndvi_mean_c - b_mean if np.isfinite(ndvi_mean_c) else np.nan
-    z_mean = float(np.ma.mean(z)) if z.count() else np.nan
-    ndwi_mean_c = (float(np.ma.mean(ndwi_m)) if ndwi_m.count()
-                   else np.nan)
+    if n_valid > 0:
+        ndvi_valid = np.asarray(ndvi_m)[valid_mask]
+        mean_valid = np.asarray(mean_m)[valid_mask]
+        z_valid = np.asarray(z)[valid_mask]
+
+        affected_arr = (z_valid < threshold) & (ndvi_valid < mean_valid)
+        frac = float(np.mean(affected_arr)) if len(affected_arr) else 0.0
+
+        ndvi_mean_c = float(np.mean(ndvi_valid)) if len(ndvi_valid) else np.nan
+        b_mean_c = float(np.mean(mean_valid)) if len(mean_valid) else np.nan
+        delta = ndvi_mean_c - b_mean_c if (np.isfinite(ndvi_mean_c) and np.isfinite(b_mean_c)) else np.nan
+        z_mean = float(np.mean(z_valid)) if len(z_valid) else np.nan
+
+        ndwi_arr = np.asarray(ndwi_m)
+        ndwi_valid_mask = valid_mask & ~np.ma.getmaskarray(ndwi_m)
+        if np.any(ndwi_valid_mask):
+            ndwi_mean_c = float(np.mean(ndwi_arr[ndwi_valid_mask]))
+        elif ndwi_m.count():
+            ndwi_mean_c = float(np.ma.mean(ndwi_m))
+        else:
+            ndwi_mean_c = np.nan
+    else:
+        frac = 0.0
+        ndvi_mean_c = np.nan
+        b_mean_c = float(np.ma.mean(mean_m)) if mean_m.count() else np.nan
+        delta = np.nan
+        z_mean = np.nan
+        ndwi_mean_c = np.nan
 
     severity = classify_severity(frac, cfg["severity"])
     cause, uncertainty = classify_cause(frac, ndwi_mean_c, delta,
-                                        cfg["ndwi_flood_threshold"])
+                                        cfg["ndwi_flood_threshold"],
+                                        claimed_peril=claimed_peril)
 
     return {
         "area_ha": round(area_ha_, 3),
@@ -191,6 +229,7 @@ def score_arrays(ndvi_m, ndwi_m, mean_m, std_m, cfg, area_ha_, n_field_pixels=No
         "affected_pct": round(frac * 100.0, 1),
         "affected_area_ha": round(frac * area_ha_, 3),  # SCREENING estimate
         "ndvi_mean": round(ndvi_mean_c, 3) if np.isfinite(ndvi_mean_c) else None,
+        "baseline_ndvi_mean": round(b_mean_c, 3) if np.isfinite(b_mean_c) else None,
         "ndvi_delta": round(delta, 3) if np.isfinite(delta) else None,
         "z_score": round(z_mean, 2) if np.isfinite(z_mean) else None,
         "ndwi_mean": round(ndwi_mean_c, 3) if np.isfinite(ndwi_mean_c) else None,
@@ -215,7 +254,9 @@ def evidence_state(metrics, cfg):
     """
     if sufficiency_flag(metrics["valid_pct"], cfg):
         return "insufficient"
-    if metrics["cause"] == "none" and metrics["affected_pct"] < 0.5:
+    if metrics.get("cause") == "none" and metrics.get("affected_pct", 0) < 0.5:
+        return "no_evidence"
+    if metrics.get("affected_pct", 0) < 0.5 and metrics.get("severity") == "none":
         return "no_evidence"
     return "assessed"
 
@@ -291,7 +332,7 @@ def read_field_rasters(paths, geom=None):
     }
 
 
-def make_field_quicklook(mean_m, ndvi_m, affected, out_path):
+def make_field_quicklook(mean_m, ndvi_m, affected, out_path, meta=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -301,35 +342,49 @@ def make_field_quicklook(mean_m, ndvi_m, affected, out_path):
     cmap_veg = plt.cm.YlGn.with_extremes(bad="#EBEBEB")
     cmap_aff = plt.cm.YlOrRd.with_extremes(bad="#EBEBEB")
 
-    # Panel 1: Typical vegetation in previous years
+    is_incident = (meta or {}).get("workflow") == "incident_comparison"
+    pre_date = (meta or {}).get("pre_scene", {}).get("date", "Pre-Incident")
+    post_date = (meta or {}).get("post_scene", {}).get("date", "Post-Incident")
+
+    if is_incident:
+        title0 = f"Pre-Incident Observation\n({pre_date} Sentinel-2 NDVI)"
+        title1 = f"Post-Incident Observation\n({post_date} Sentinel-2 NDVI)"
+        label_bar0 = "Pre-Incident NDVI"
+        label_bar1 = "Post-Incident NDVI"
+        main_title = f"Incident Before-and-After Evidence — Sentinel-2 Crop Damage Analysis ({meta.get('peril', 'Claimed Peril')})"
+    else:
+        title0 = "Historical Baseline Norm\n(Healthy Multi-Year Baseline NDVI)"
+        title1 = "Claim Observation Period\n(Observed Sentinel-2 NDVI)"
+        label_bar0 = "NDVI (Greener = healthier norm)"
+        label_bar1 = "Observed NDVI"
+        main_title = "Satellite Field Evidence — Sentinel-2 Crop Damage Screening (Grey = clouds, shadow, or outside boundary)"
+
+    # Panel 1: Pre-Incident / Baseline
     im0 = axes[0].imshow(mean_m, cmap=cmap_veg, vmin=0.05, vmax=0.8)
-    axes[0].set_title("Typical vegetation in previous years\n(Historical baseline NDVI)",
-                      fontsize=11, fontweight="bold", pad=8)
+    axes[0].set_title(title0, fontsize=11, fontweight="bold", pad=8)
     axes[0].set_xticks([])
     axes[0].set_yticks([])
     cbar0 = plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
-    cbar0.set_label("NDVI (Greener = healthier norm)", fontsize=9)
+    cbar0.set_label(label_bar0, fontsize=9)
 
-    # Panel 2: Vegetation during selected period
+    # Panel 2: Post-Incident / Observed
     im1 = axes[1].imshow(ndvi_m, cmap=cmap_veg, vmin=0.05, vmax=0.8)
-    axes[1].set_title("Vegetation during selected period\n(Observed Sentinel-2 NDVI)",
-                      fontsize=11, fontweight="bold", pad=8)
+    axes[1].set_title(title1, fontsize=11, fontweight="bold", pad=8)
     axes[1].set_xticks([])
     axes[1].set_yticks([])
     cbar1 = plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
-    cbar1.set_label("Observed NDVI", fontsize=9)
+    cbar1.set_label(label_bar1, fontsize=9)
 
-    # Panel 3: Locations flagged for possible stress
+    # Panel 3: Damage Screening Indicator
     im2 = axes[2].imshow(affected.astype(float), cmap=cmap_aff, vmin=0, vmax=1)
-    axes[2].set_title("Locations flagged for possible stress\n(Negative anomaly screening)",
+    axes[2].set_title("Damage Screening Indicator\n(Flagged Negative Anomaly: z < -1.5)",
                       fontsize=11, fontweight="bold", pad=8)
     axes[2].set_xticks([])
     axes[2].set_yticks([])
     cbar2 = plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04, ticks=[0, 1])
     cbar2.ax.set_yticklabels(["Normal / No stress", "Flagged stress"])
 
-    fig.suptitle("Satellite Field Evidence — Agricultural Screening (Grey = clouds, shadow, or outside boundary)",
-                 fontsize=10, y=0.98, color="#444444")
+    fig.suptitle(main_title, fontsize=10, y=0.98, color="#444444")
     plt.tight_layout(rect=(0, 0, 1, 0.94))
     plt.savefig(out_path, dpi=120)
     plt.close(fig)
@@ -340,7 +395,7 @@ def make_field_quicklook(mean_m, ndvi_m, affected, out_path):
 # End-to-end assessment of the exact selected geometry
 # --------------------------------------------------------------------------- #
 def assess_field(cfg, geom, mode, root=ROOT, run_id=None, rasters_dir=None,
-                 meta=None, seed=None):
+                 meta=None, seed=None, claim_info=None, **kwargs):
     """Run the full field workflow for the SELECTED geometry.
 
     - mode: 'live' (Earth Engine, cached) | 'demo' (deterministic
@@ -351,7 +406,7 @@ def assess_field(cfg, geom, mode, root=ROOT, run_id=None, rasters_dir=None,
     """
     geom = validate_geometry(geom)
     run_id = run_id or new_run_id()
-    data_dir = os.path.join(root, cfg["data_dir"])
+    data_dir = os.path.join(root, cfg.get("data_dir", "data"))
 
     if rasters_dir is None:
         meta, procdir = prepare_rasters(cfg, geom, mode, root, run_id,
@@ -379,18 +434,34 @@ def assess_field(cfg, geom, mode, root=ROOT, run_id=None, rasters_dir=None,
 
     arrays = read_field_rasters(paths, geom=geom)
     ha = area_ha(geom)
+    c_peril = (claim_info or {}).get("claimed_cause") or meta.get("peril")
     metrics = score_arrays(arrays["ndvi"], arrays["ndwi"],
                            arrays["mean"], arrays["std"], cfg, ha,
-                           n_field_pixels=arrays.get("n_field_pixels"))
+                           n_field_pixels=arrays.get("n_field_pixels"),
+                           claimed_peril=c_peril)
     metrics["mode"] = mode
     metrics["run_id"] = run_id
     metrics["geometry_wkt"] = geom.wkt
     metrics["bounds_wgs84"] = [round(v, 6) for v in geom.bounds]
     metrics["centroid_wgs84"] = [round(geom.centroid.y, 6),
                                  round(geom.centroid.x, 6)]
-    metrics["param_key"] = param_key(
-        mode, geom.wkt, cfg["event_window"], cfg["baseline_years"],
-        canonical_settings(cfg))
+    metrics["claim_info"] = claim_info or {}
+    metrics["workflow"] = meta.get("workflow", "baseline_composite")
+    metrics["event_window"] = meta.get("event_window") or cfg.get("event_window")
+    metrics["incident_date"] = (claim_info or {}).get("incident_date") or meta.get("incident_date")
+    metrics["search_window"] = meta.get("search_window") or cfg.get("search_window")
+
+    if meta.get("workflow") == "incident_comparison":
+        inc_str = str(metrics["incident_date"] or "none")
+        wf_mode = (claim_info or {}).get("workflow_mode") or meta.get("workflow_mode", "historical")
+        c_peril_str = c_peril or "General"
+        metrics["param_key"] = param_key(
+            mode, geom.wkt, [inc_str, wf_mode, c_peril_str],
+            cfg.get("baseline_years", []), canonical_settings(cfg))
+    else:
+        metrics["param_key"] = param_key(
+            mode, geom.wkt, cfg.get("event_window", ["none", "none"]),
+            cfg.get("baseline_years", []), canonical_settings(cfg))
 
     # evidence: distinguish "no evidence" from "not enough data"
     state = evidence_state(metrics, cfg)
@@ -409,7 +480,7 @@ def assess_field(cfg, geom, mode, root=ROOT, run_id=None, rasters_dir=None,
 
     # outputs (all inside this run's directory — stale outputs can't be
     # confused with a new run)
-    outdir = os.path.join(root, cfg["out_dir"], run_id)
+    outdir = os.path.join(root, cfg.get("out_dir", "data/outputs"), run_id)
     os.makedirs(outdir, exist_ok=True)
 
     geometry_props = {k: geojson_safe_value(v) for k, v in metrics.items()}
@@ -421,19 +492,20 @@ def assess_field(cfg, geom, mode, root=ROOT, run_id=None, rasters_dir=None,
     metrics_path = os.path.join(outdir, "field_metrics.json")
     with open(metrics_path, "w") as fh:
         json.dump({"run_id": run_id, "param_key": metrics["param_key"],
-                   "metrics": metrics, "acquisition": meta}, fh, indent=2)
+                   "metrics": metrics, "acquisition": meta,
+                   "claim_info": claim_info or {}}, fh, indent=2)
 
     z = anomaly_z(arrays["ndvi"], arrays["mean"], arrays["std"])
     affected = ((z < -abs(cfg["ndvi_z_threshold"]))
                 & (arrays["ndvi"] < arrays["mean"]))
     quicklook = os.path.join(outdir, "field_quicklook.png")
-    make_field_quicklook(arrays["mean"], arrays["ndvi"], affected, quicklook)
+    make_field_quicklook(arrays["mean"], arrays["ndvi"], affected, quicklook, meta=meta)
 
     import report
     pdf_dir = os.path.join(root, cfg.get("report_dir", "reports"), run_id)
     os.makedirs(pdf_dir, exist_ok=True)
     pdf = os.path.join(pdf_dir, f"FarmAid_field_report_{run_id}.pdf")
-    report.build_field_report(cfg, metrics, meta, quicklook, pdf)
+    report.build_field_report(cfg, metrics, meta, quicklook, pdf, claim_info=claim_info)
 
     return {
         "run_id": run_id,
@@ -446,6 +518,7 @@ def assess_field(cfg, geom, mode, root=ROOT, run_id=None, rasters_dir=None,
         "outdir": outdir,
         "procdir": procdir,
         "meta": meta,
+        "claim_info": claim_info or {},
     }
 
 
@@ -458,12 +531,28 @@ def main():
     ap.add_argument("--live", action="store_true",
                     help="query Earth Engine for the boundary (requires "
                          "auth); default is demo mode")
+    ap.add_argument("--claim-ref", default=None, help="Insurance claim reference number")
+    ap.add_argument("--policy-no", default=None, help="Policy number")
+    ap.add_argument("--claimant-name", default=None, help="Claimant / insured name")
+    ap.add_argument("--crop-type", default=None, help="Insured crop type")
+    ap.add_argument("--peril", default=None, help="Claimed peril / cause")
+    ap.add_argument("--incident-date", default=None, help="Claimed incident date (YYYY-MM-DD)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
     geom = geometry_from_inputs(coords=args.coords, geojson_path=args.geojson)
     mode = "live" if args.live else "demo"
-    res = assess_field(cfg, geom, mode)
+    claim_info = None
+    if any([args.claim_ref, args.policy_no, args.claimant_name, args.crop_type, args.peril, args.incident_date]):
+        claim_info = {
+            "claim_ref": args.claim_ref or "Not provided",
+            "policy_no": args.policy_no or "Not provided",
+            "claimant_name": args.claimant_name or "Not provided",
+            "crop_type": args.crop_type or "Not specified",
+            "claimed_cause": args.peril or "General Crop Stress",
+            "incident_date": args.incident_date,
+        }
+    res = assess_field(cfg, geom, mode, claim_info=claim_info)
     m = res["metrics"]
     print(f"\nField assessment ({mode}) run {res['run_id']}")
     print(f"  geometry       : {geom.wkt[:80]}…")

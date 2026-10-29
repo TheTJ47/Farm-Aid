@@ -1,5 +1,58 @@
 # CHANGELOG.md
 
+## v0.4.9 — Satellite-based crop damage insurance assessment core fixes (2026-10-26)
+**Status: fully executed and verified in Windows PowerShell environment. All 81 automated tests passing (1 skipped for live EE check).**
+
+### Key Findings & Fixes
+- **1. Universal `claim_info` Support & Keyword Guard (`src/field.py`)**:
+  - Fixed `TypeError: assess_field() got an unexpected keyword argument 'claim_info'` across all execution paths.
+  - Added `claim_info=None, **kwargs` to `assess_field` signature and updated CLI argument parser in `src/field.py::main()` to accept `--claim-ref`, `--policy-no`, `--claimant-name`, `--crop-type`, `--peril`, and `--incident-date`.
+- **2. Date & Observation-Window Harmonization (`src/incident.py`, `src/field.py`, `src/storage.py`, `src/report.py`, `app/dashboard.py`)**:
+  - Removed artificial `-7 days` reference date alteration in `src/incident.py::discover_incident_scenes()`. The user's claimed incident date is strictly preserved without mutation or fabrication.
+  - In recent mode, scene discovery chronologically pairs the latest suitable pass (`selected_post`) with the closest prior suitable pass (`selected_pre`).
+  - Added exact observation-window metadata (`[selected_pre['date'], selected_post['date']]`) and search window metadata to `fetch_incident_rasters`, `fetch_incident_demo`, `metrics`, `save_assessment`, `load_active_assessment`, `build_field_report`, and dashboard display tables.
+  - Synchronized `param_key` computation in `assess_field` with `app/dashboard.py` for incident comparison workflows (`[incident_date, workflow_mode, claimed_peril]`).
+- **3. Damage Calculation & Denominator Audit (`src/field.py`, `src/analyze.py`)**:
+  - Confirmed strict separation between regional grid results (300m cells across buffered landscape in `src/analyze.py`) and parcel-level results (clipped exact polygon in `src/field.py`).
+  - Verified parcel pixel count (`n_field_pixels`, calculated via rasterio geometry mask) is the denominator for `valid_pct`.
+  - Verified valid pixel count (`n_valid`, co-located pixels finite and non-nodata in both event and baseline) is the denominator for `affected_pct`.
+  - Verified estimated affected area scales true parcel planar area (`area_ha`) by `frac` (the fraction of anomalous valid pixels).
+  - Enhanced `evidence_state` to robustly classify `no_evidence` when qualifying anomalies are below 0.5% with severity `none`.
+- **4. Evidentiary Insurance Report & Uncertainty Principles (`src/report.py`)**:
+  - Re-anchored Section 1 and Section 2 around claimed incident dates and actual satellite acquisition dates with explicit day offsets.
+  - Rewrote uncertainty explanations: explicitly articulated that 100% clear satellite imagery confirms optical observation completeness, but does NOT equate to 100% certainty of legal cause or crop loss without ground verification.
+  - Added peril-specific Loss Adjuster Verification Checklists in Section 7 for Inundation/Flood, Drought/Dryness, Hail/Storm, and General agronomic management cross-checks.
+  - Clarified hail limitations: optical sensors detect acute defoliation but cannot prove hail impact without Doppler radar storm tracking or on-site panchnama.
+- **5. Regression Tests (`tests/test_pipeline.py`)**:
+  - Added `test_assess_field_accepts_unexpected_kwargs_and_claim_info`.
+  - Added `test_incident_date_and_observation_window_consistency`.
+  - Added `test_damage_calculation_denominators_and_metrics`.
+  - Added `test_field_report_with_claim_info_and_peril_checklist`.
+  - Full test suite passes: **81 passed, 1 skipped**.
+
+## v0.4.8 — Post-assessment dashboard loading & synchronization fix (2026-10-26)
+**Status: fully executed and verified in Windows PowerShell environment. All 77 automated tests passing (1 skipped for live EE check).**
+
+### Key Findings & Fixes
+- **Root Cause Investigation**:
+  - Investigated intermittent failure of dashboard to automatically display analysis immediately after "Run before-and-after assessment":
+    1. *Staleness Discrepancy*: `canonical_settings(eff)` used the user-configured `max_cloud` during assessment run, whereas the dashboard's staleness check evaluated `canonical_settings(cfg)` using `config.yaml` default (60%). When `max_cloud != 60`, `run_is_current` evaluated to `False`, displaying a stale results warning and suppressing the results section.
+    2. *Folium Drawing Desynchronization*: In `st_folium`, drawn geometries from previous Leaflet interactions triggered `new_geom.wkt != sel.wkt` checks even in `Coordinates (box)` mode or due to floating-point vertex permutations, resetting `st.session_state[RUN] = None` and forcing a blank rerun.
+    3. *Separated Loading Paths*: Manual saved-run loading in Tab 2 read directly from disk, whereas the automatic post-run path relied on volatile session state without a dedicated synchronization loader.
+- **Unified Loading Architecture (`src/storage.py`, `app/dashboard.py`)**:
+  - Implemented `storage.load_active_assessment(run_id)`: unified loader used by both automatic post-assessment completion and manual saved-run reopen actions.
+  - Enhanced `storage.save_assessment` to persist `workflow_mode`, `incident_date`, `claimed_peril`, and `discovery` scene records.
+  - Introduced explicit `ACTIVE_RUN_ID` and `LAST_SUCCESS_MSG` in session state to maintain lockstep synchronization between run ID, artifacts, and UI notifications.
+  - Restricted Leaflet draw event processing strictly to `input_mode == "Draw on map"`, using Shapely topological `not curr_geom.equals(new_geom)` instead of fragile WKT string comparison.
+  - Harmonized `canonical_settings(eff_cfg)` with active UI `max_cloud` so post-run results are immediately recognized as current.
+  - Updated Results Section in Tab 1 to render whenever an active run is present; if input parameters change, a prominent warning is displayed without suppressing the active analysis.
+- **Regression Tests (`tests/test_pipeline.py`)**:
+  - `test_consecutive_runs_and_active_run_activation`: verifies that consecutive runs immediately and automatically activate the newest run.
+  - `test_manual_saved_run_loading`: verifies manual loading recovers all metrics, artifacts, and claim details.
+  - `test_artifact_loading_failure_prevents_silent_stale_display`: verifies corrupted/missing runs return `None` and fail safely without showing stale analysis.
+  - `test_param_key_consistency_with_user_settings`: verifies parameter key consistency with custom user settings.
+  - Full test suite passes: **77 passed, 1 skipped**.
+
 ## v0.4.6 — Live run audit, GeoTIFF nodata masking fix, and real calculation verification (2026-10-26)
 **Status: fully executed and verified in Windows PowerShell environment. All 66 automated tests passing (1 skipped for live EE check). Verified against live run `run_20261026T043351_512dc0`.**
 

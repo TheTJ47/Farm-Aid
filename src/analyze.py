@@ -82,16 +82,29 @@ def classify_severity(frac, cut):
     return "none"
 
 
-def classify_cause(affected_frac, ndwi_mean, ndvi_delta, flood_thr):
-    """Provisional cause: flood (anomaly + water signal), drought (strong
-    anomaly + context), unknown (inconclusive). Hail is NOT supported and
-    is never returned — suspects fall to 'unknown'."""
+def classify_cause(affected_frac, ndwi_mean, ndvi_delta, flood_thr, claimed_peril=None):
+    """Provisional cause evaluation tailored to reported peril and spectral signatures.
+    - Flood / Inundation: Flagged anomaly + elevated water/moisture signal (NDWI > flood_thr).
+    - Drought / Dryness: Flagged anomaly + persistent canopy dry-down (ΔNDVI < -0.15) with dry NDWI.
+    - Hail: Optical multispectral sensors can observe acute defoliation/scarring between adjacent clear passes,
+      but cannot confirm hail impact without radar trajectory data. If claimed and acute drop observed, returns
+      'hail_suspected (radar verification required)', else 'unknown'.
+    - Unknown: When spectral evidence does not clearly distinguish between abiotic stress, disease, or management.
+    """
     if affected_frac <= 0:
         return "none", "low"
+
+    peril_str = str(claimed_peril or "").lower()
+
     if ndwi_mean > flood_thr:
         uncertainty = "low" if ndwi_mean > 1.5 * flood_thr else "medium"
         return "flood", uncertainty
+    if "hail" in peril_str and ndvi_delta < -0.10:
+        # Acute loss reported as hail: note that satellite indicates physical damage but hail cannot be proved by NDVI alone
+        return "hail_suspected", "high"
     if ndvi_delta < -0.15:
+        if "drought" in peril_str or "dry" in peril_str:
+            return "drought", "low"
         return "drought", "medium"
     return "unknown", "high"
 
@@ -190,13 +203,20 @@ def run_grid(cfg, procdir, outdir):
             total_px = win.width * win.height
             valid_pct = 100.0 * n_valid / total_px
 
-            v_aff = (v_z < threshold) & (v_ndvi < v_mean)
+            common_mask = np.ma.getmaskarray(v_z)
+            v_ndvi_valid = np.ma.masked_where(common_mask, v_ndvi)
+            v_mean_valid = np.ma.masked_where(common_mask, v_mean)
+            v_ndwi_valid = np.ma.masked_where(common_mask, v_ndwi)
+
+            v_aff = (v_z < threshold) & (v_ndvi_valid < v_mean_valid)
             affected_frac = (float(np.ma.mean(v_aff)) if v_aff.count()
                              else 0.0)
-            ndvi_mean_c = float(np.ma.mean(v_ndvi))
-            ndwi_mean_c = float(np.ma.mean(v_ndwi))
-            delta = ndvi_mean_c - float(np.ma.mean(v_mean))
+            ndvi_mean_c = float(np.ma.mean(v_ndvi_valid))
+            baseline_mean_c = float(np.ma.mean(v_mean_valid))
+            delta = ndvi_mean_c - baseline_mean_c
             z_mean = float(np.ma.mean(v_z))
+            ndwi_mean_c = (float(np.ma.mean(v_ndwi_valid)) if v_ndwi_valid.count()
+                           else (float(np.ma.mean(v_ndwi)) if v_ndwi.count() else np.nan))
 
             severity = classify_severity(affected_frac, cut)
             cause, uncertainty = classify_cause(

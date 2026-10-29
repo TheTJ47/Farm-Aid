@@ -14,6 +14,7 @@ Live-credential tests are skipped when Earth Engine is unavailable.
 
 Run:  python -m pytest -q
 """
+import copy
 import json
 import os
 import sys
@@ -37,6 +38,8 @@ import fetch_gee  # noqa: E402
 from fetch_gee import (FarmAidDataError, ensure_collection_size,
                        fetch_demo, selection_to_aoi)  # noqa: E402
 import field  # noqa: E402
+import field as fieldmod  # noqa: E402
+import incident as incidentmod  # noqa: E402
 from field import (area_ha, assess_field, evidence_state,
                    geometry_from_inputs, score_arrays,
                    sufficiency_flag, validate_geometry)  # noqa: E402
@@ -46,6 +49,7 @@ from runmeta import canonical_settings, new_run_id, param_key, \
 from report import (HA_TO_ACRES, build_field_report, build_report,
                     generate_field_insights)  # noqa: E402
 import storage  # noqa: E402
+from storage import save_assessment, load_active_assessment, load_saved_assessment  # noqa: E402
 from shapely.geometry import Point, box  # noqa: E402
 
 CUT = {"low": 0.05, "moderate": 0.15, "high": 0.35}
@@ -1034,6 +1038,555 @@ def test_field_vs_regional_divergence_logic():
     r_metrics = score_arrays(r_ndvi, r_ndwi, r_mean, r_std, CFG, area_ha_=0.276)
     assert r_metrics["affected_pct"] == pytest.approx(100.0)
     assert r_metrics["severity"] == "high"
+
+
+def test_score_arrays_zero_valid_and_consistent_pixels():
+    """Regression test:
+    1) Zero valid pixels: returns None for ndvi_mean, ndvi_delta, z_score, ndwi_mean.
+    2) Heterogeneous baseline with partial valid pixels: ndvi_mean, baseline_ndvi_mean,
+       and ndvi_delta must be evaluated strictly on the co-located valid pixels."""
+    shape = (10, 10)
+    # Heterogeneous baseline: top half is 0.40, bottom half is 0.80.
+    mean = np.full(shape, 0.80, dtype=float)
+    mean[:5, :] = 0.40  # Top half baseline = 0.40
+    std = np.full(shape, 0.05, dtype=float)
+    ndwi = np.full(shape, -0.10, dtype=float)
+
+    # Event: bottom half is obscured by cloud (-9999.0)
+    ndvi = np.full(shape, -9999.0, dtype=float)
+    # Top half observed NDVI is 0.45 (+0.05 higher than its 0.40 baseline)
+    ndvi[:5, :] = 0.45
+
+    m_partial = score_arrays(ndvi, ndwi, mean, std, CFG, area_ha_=1.0, n_field_pixels=100)
+    assert m_partial["valid_pct"] == pytest.approx(50.0)
+    assert m_partial["n_valid_pixels"] == 50
+    # Must match the 0.45 observed mean
+    assert m_partial["ndvi_mean"] == pytest.approx(0.45, abs=0.001)
+    # Baseline mean must be 0.40 (from the top half co-located pixels), NOT 0.60 (whole field)
+    assert m_partial["baseline_ndvi_mean"] == pytest.approx(0.40, abs=0.001)
+    # Delta must be +0.05 (+0.45 - 0.40), NOT -0.15 (0.45 - 0.60)
+    assert m_partial["ndvi_delta"] == pytest.approx(0.05, abs=0.001)
+    assert m_partial["z_score"] == pytest.approx(1.00, abs=0.05)
+    assert m_partial["affected_pct"] == pytest.approx(0.0)
+
+    # Completely cloudy event: 0 valid pixels
+    ndvi_cloudy = np.full(shape, -9999.0, dtype=float)
+    m_zero = score_arrays(ndvi_cloudy, ndwi, mean, std, CFG, area_ha_=1.0, n_field_pixels=100)
+    assert m_zero["valid_pct"] == pytest.approx(0.0)
+    assert m_zero["n_valid_pixels"] == 0
+    assert m_zero["ndvi_mean"] is None
+    assert m_zero["ndvi_delta"] is None
+    assert m_zero["z_score"] is None
+    assert m_zero["ndwi_mean"] is None
+    assert m_zero["affected_pct"] == pytest.approx(0.0)
+
+
+def test_dashboard_none_safe_technical_formatting():
+    """Regression test for app/dashboard.py:574:
+    Metrics with None values (like run_20261026T055258_717834) must format safely
+    without TypeError: unsupported operand type(s) for -: 'NoneType' and 'int'."""
+    import math
+
+    m_none = {
+        "ndvi_mean": None,
+        "ndvi_delta": None,
+        "z_score": None,
+        "ndwi_mean": None,
+        "baseline_ndvi_mean": None,
+    }
+
+    b_mean_val = m_none.get("baseline_ndvi_mean")
+    if b_mean_val is None and m_none.get("ndvi_mean") is not None and m_none.get("ndvi_delta") is not None:
+        b_mean_val = round(m_none["ndvi_mean"] - m_none["ndvi_delta"], 3)
+
+    def _fmt_stat(val, decimals=3):
+        if val is None or not isinstance(val, (int, float)) or not math.isfinite(val):
+            return "N/A (insufficient clear data)"
+        return f"{val:.{decimals}f}"
+
+    assert _fmt_stat(m_none.get("ndvi_mean")) == "N/A (insufficient clear data)"
+    assert _fmt_stat(b_mean_val) == "N/A (insufficient clear data)"
+    assert _fmt_stat(m_none.get("ndvi_delta")) == "N/A (insufficient clear data)"
+    assert _fmt_stat(m_none.get("z_score"), 2) == "N/A (insufficient clear data)"
+
+    # Also test valid numeric metrics
+    m_valid = {
+        "ndvi_mean": 0.654,
+        "ndvi_delta": -0.052,
+        "z_score": -1.25,
+        "ndwi_mean": -0.123,
+        "baseline_ndvi_mean": 0.706,
+    }
+    assert _fmt_stat(m_valid.get("ndvi_mean")) == "0.654"
+    assert _fmt_stat(m_valid.get("baseline_ndvi_mean")) == "0.706"
+    assert _fmt_stat(m_valid.get("ndvi_delta")) == "-0.052"
+    assert _fmt_stat(m_valid.get("z_score"), 2) == "-1.25"
+
+
+def test_build_field_report_with_none_metrics(tmp_path):
+    """Regression test: build_field_report must build cleanly when metrics are None."""
+    from PIL import Image as PILImage
+
+    img_path = str(tmp_path / "quicklook.png")
+    PILImage.new("RGB", (100, 100), color="grey").save(img_path)
+
+    metrics = {
+        "area_ha": 0.96, "valid_pct": 0.0, "affected_pct": 0.0,
+        "affected_area_ha": 0.0, "ndvi_mean": None, "ndvi_delta": None,
+        "z_score": None, "ndwi_mean": None, "severity": "unassessable",
+        "cause": "unknown", "uncertainty": "high", "insufficient_data": True,
+        "run_id": "run_test_none", "bounds_wgs84": [74.6, 19.3, 74.7, 19.4]
+    }
+    meta = {
+        "mode": "gee", "synthetic": False, "crs": "EPSG:32643", "scale_m": 10,
+        "event_window": ["2025-08-01", "2025-09-15"],
+        "baseline_window": ["08-01", "09-15"],
+        "baseline_years": [2022, 2023],
+        "event": {"images": 2, "first": "2025-08-11", "last": "2025-09-10", "coverage_pct": 62.5},
+        "baseline_periods": [{"year": 2022, "images": 2, "first": "2022-09-01", "last": "2022-09-06", "coverage_pct": 93.5}]
+    }
+    out_pdf = str(tmp_path / "test_report.pdf")
+    build_field_report(CFG, metrics, meta, img_path, out_pdf)
+    assert os.path.exists(out_pdf)
+    with open(out_pdf, "rb") as fh:
+        assert fh.read(5) == b"%PDF-"
+
+
+def test_build_field_report_with_claim_info(tmp_path):
+    """Test that build_field_report incorporates claim metadata and multi-page NumberedCanvas."""
+    from PIL import Image as PILImage
+
+    img_path = str(tmp_path / "quicklook2.png")
+    PILImage.new("RGB", (100, 100), color="green").save(img_path)
+
+    metrics = {
+        "area_ha": 4.5, "valid_pct": 92.5, "affected_pct": 24.0,
+        "affected_area_ha": 1.08, "ndvi_mean": 0.42, "ndvi_delta": -0.18,
+        "baseline_ndvi_mean": 0.60, "z_score": -1.85, "ndwi_mean": 0.12,
+        "severity": "moderate", "cause": "flood", "uncertainty": "low",
+        "insufficient_data": False, "no_evidence_of_damage": False,
+        "run_id": "run_test_claim", "param_key": "param_test_claim_123",
+        "bounds_wgs84": [74.6, 19.3, 74.7, 19.4],
+        "centroid_wgs84": [19.35, 74.65],
+    }
+    meta = {
+        "mode": "live", "synthetic": False, "crs": "EPSG:32643", "scale_m": 10,
+        "event_window": ["2025-08-01", "2025-09-15"],
+        "baseline_window": ["08-01", "09-15"],
+        "baseline_years": [2021, 2022],
+        "event": {"images": 4, "first": "2025-08-05", "last": "2025-09-10", "coverage_pct": 94.0},
+        "baseline_periods": [
+            {"year": 2021, "images": 3, "first": "2021-08-10", "last": "2021-09-12", "coverage_pct": 91.0},
+            {"year": 2022, "images": 4, "first": "2022-08-08", "last": "2022-09-14", "coverage_pct": 95.0}
+        ]
+    }
+    claim_info = {
+        "claim_ref": "CLM-2026-TEST",
+        "policy_no": "POL-998877",
+        "claimant_name": "Kisan Rao",
+        "crop_type": "Soybean",
+        "claimed_cause": "Inundation / Flood",
+    }
+    out_pdf = str(tmp_path / "claim_evidence_report.pdf")
+    build_field_report(CFG, metrics, meta, img_path, out_pdf, claim_info=claim_info)
+    assert os.path.exists(out_pdf)
+    assert os.path.getsize(out_pdf) > 5000  # valid multi-section PDF
+
+
+def test_storage_save_and_load_claim_info(tmp_path):
+    """Test persistence and retrieval of claim information in storage."""
+    from storage import save_assessment, load_saved_assessment
+
+    saved_dir = str(tmp_path / "saved")
+    run_data = {
+        "run_id": "run_persisted_claim",
+        "param_key": "key_persisted_123",
+        "mode": "live",
+        "event_window": ["2025-08-01", "2025-09-15"],
+        "baseline_years": [2022, 2023],
+        "geom_wkt": "POLYGON ((74.6 19.3, 74.7 19.3, 74.7 19.4, 74.6 19.4, 74.6 19.3))",
+        "claim_info": {
+            "claim_ref": "CLM-PERSIST",
+            "policy_no": "POL-PERSIST",
+            "claimant_name": "Test Claimant",
+            "crop_type": "Cotton",
+            "claimed_cause": "Drought",
+        },
+        "metrics": {"area_ha": 5.0, "valid_pct": 88.0, "affected_pct": 10.0},
+    }
+    save_path = save_assessment(run_data, saved_dir=saved_dir)
+    assert os.path.exists(save_path)
+
+    loaded = load_saved_assessment("run_persisted_claim", saved_dir=saved_dir)
+    assert loaded is not None
+    assert loaded["claim_info"]["claim_ref"] == "CLM-PERSIST"
+    assert loaded["claim_info"]["crop_type"] == "Cotton"
+    assert loaded["metrics"]["area_ha"] == 5.0
+
+
+def test_classify_cause_with_peril():
+    """Verify classify_cause custom tailoring for flood, drought, hail, and unknown."""
+    # 1. Flood: elevated NDWI (0.08 > 1.5 * 0.05 -> low uncertainty)
+    c_flood, u_flood = analyze.classify_cause(0.25, 0.08, -0.20, 0.05, claimed_peril="Inundation / Flood")
+    assert c_flood == "flood"
+    assert u_flood == "low"
+
+    # 2. Drought: persistent negative NDVI with dry NDWI
+    c_drought, u_drought = analyze.classify_cause(0.30, -0.05, -0.22, 0.05, claimed_peril="Drought / Dry Spell")
+    assert c_drought == "drought"
+    assert u_drought == "low"
+
+    # 3. Hail: acute drop reported as hail
+    c_hail, u_hail = analyze.classify_cause(0.20, -0.02, -0.18, 0.05, claimed_peril="Other / Hail")
+    assert c_hail == "hail_suspected"
+    assert u_hail == "high"
+
+    # 4. Unknown: moderate anomaly without distinct moisture or dryness signal
+    c_unk, u_unk = analyze.classify_cause(0.12, 0.01, -0.08, 0.05, claimed_peril="General Crop Stress")
+    assert c_unk == "unknown"
+
+
+def test_incident_demo_before_after_comparison(tmp_path):
+    """Verify that fetch_incident_demo generates aligned pre and post incident rasters and report."""
+    from incident import fetch_incident_demo
+    import field as fieldmod
+
+    geom = box(74.63, 19.37, 74.67, 19.41)
+    procdir = str(tmp_path / "incident_demo")
+    disc, meta = fetch_incident_demo(CFG, geom, "2025-08-15", procdir, peril="Flood")
+
+    assert disc["data_sufficiency"] == "sufficient"
+    assert disc["selected_pre"] is not None
+    assert disc["selected_post"] is not None
+    assert meta["workflow"] == "incident_comparison"
+
+    # Verify rasters exist
+    for r in ["pre_ndvi.tif", "post_ndvi.tif", "baseline_mean.tif", "event_ndvi.tif"]:
+        assert os.path.exists(os.path.join(procdir, r))
+
+    # Run assess_field on this directory
+    claim_info = {
+        "claim_ref": "CLM-INCIDENT-DEMO",
+        "policy_no": "POL-INCIDENT-999",
+        "claimant_name": "Ramesh Patil",
+        "crop_type": "Soybean",
+        "claimed_cause": "Inundation / Flood",
+        "incident_date": "2025-08-15",
+    }
+    run_id = "run_inc_demo_test"
+    res = fieldmod.assess_field(
+        CFG, geom, "demo", root=str(tmp_path), run_id=run_id,
+        rasters_dir=procdir, meta=meta, claim_info=claim_info
+    )
+
+    assert res["run_id"] == run_id
+    assert res["metrics"]["workflow"] == "incident_comparison"
+    assert res["metrics"]["area_ha"] > 0
+    assert os.path.exists(res["pdf"])
+    assert os.path.exists(res["quicklook"])
+
+
+def test_consecutive_runs_and_active_run_activation(tmp_path):
+    """Test consecutive successful runs automatically update the active run and artifacts."""
+    from storage import save_assessment, load_active_assessment
+    saved_dir = str(tmp_path / "saved")
+
+    geom_wkt = "POLYGON ((74.63 19.37, 74.63 19.41, 74.67 19.41, 74.67 19.37, 74.63 19.37))"
+
+    # Run 1
+    run_id_1 = "run_20261026T100000_111111"
+    run_data_1 = {
+        "run_id": run_id_1,
+        "param_key": "key111",
+        "mode": "demo",
+        "workflow_mode": "historical",
+        "incident_date": "2025-08-15",
+        "claimed_peril": "Inundation / Flood",
+        "geom_wkt": geom_wkt,
+        "metrics": {"area_ha": 5.0, "affected_pct": 12.0, "severity": "low", "cause": "flood"},
+        "claim_info": {"claim_ref": "CLM-RUN-1"},
+    }
+    save_assessment(run_data_1, saved_dir=saved_dir)
+
+    active_1 = load_active_assessment(run_id_1, saved_dir=saved_dir)
+    assert active_1 is not None
+    assert active_1["run_id"] == run_id_1
+    assert active_1["claim_info"]["claim_ref"] == "CLM-RUN-1"
+
+    # Run 2 (consecutive run)
+    run_id_2 = "run_20261026T100500_222222"
+    run_data_2 = {
+        "run_id": run_id_2,
+        "param_key": "key222",
+        "mode": "demo",
+        "workflow_mode": "recent",
+        "incident_date": "2026-10-26",
+        "claimed_peril": "Drought / Dry Spell",
+        "geom_wkt": geom_wkt,
+        "metrics": {"area_ha": 5.0, "affected_pct": 28.0, "severity": "moderate", "cause": "drought"},
+        "claim_info": {"claim_ref": "CLM-RUN-2"},
+    }
+    save_assessment(run_data_2, saved_dir=saved_dir)
+
+    active_2 = load_active_assessment(run_id_2, saved_dir=saved_dir)
+    assert active_2 is not None
+    assert active_2["run_id"] == run_id_2
+    assert active_2["run_id"] != active_1["run_id"]
+    assert active_2["claim_info"]["claim_ref"] == "CLM-RUN-2"
+    assert active_2["metrics"]["affected_pct"] == 28.0
+
+
+def test_manual_saved_run_loading(tmp_path):
+    """Test manual loading of an existing saved run recovers complete active run dict."""
+    from storage import save_assessment, load_active_assessment, load_saved_assessment
+    saved_dir = str(tmp_path / "saved")
+
+    run_id = "run_historical_saved_test"
+    run_data = {
+        "run_id": run_id,
+        "param_key": "key_saved",
+        "mode": "live",
+        "workflow_mode": "historical",
+        "incident_date": "2025-08-15",
+        "claimed_peril": "Other / Hail",
+        "discovery": {
+            "selected_pre": {"date": "2025-08-11", "field_clear_pct": 95.0},
+            "selected_post": {"date": "2025-09-10", "field_clear_pct": 68.0},
+        },
+        "geom_wkt": "POLYGON ((74.6 19.3, 74.6 19.4, 74.7 19.4, 74.7 19.3, 74.6 19.3))",
+        "metrics": {"area_ha": 10.0, "affected_pct": 40.0, "severity": "high", "cause": "hail_suspected"},
+        "claim_info": {"claim_ref": "CLM-HAIL-77", "crop_type": "Pomegranate"},
+    }
+    save_assessment(run_data, saved_dir=saved_dir)
+
+    # Verify standard loader
+    rec = load_saved_assessment(run_id, saved_dir=saved_dir)
+    assert rec is not None
+    assert rec["run_id"] == run_id
+
+    # Verify active dashboard loader
+    active = load_active_assessment(run_id, saved_dir=saved_dir)
+    assert active is not None
+    assert active["run_id"] == run_id
+    assert active["workflow_mode"] == "historical"
+    assert active["claimed_peril"] == "Other / Hail"
+    assert active["discovery"]["selected_pre"]["date"] == "2025-08-11"
+    assert active["claim_info"]["claim_ref"] == "CLM-HAIL-77"
+    assert active["res"]["metrics"]["severity"] == "high"
+
+
+def test_artifact_loading_failure_prevents_silent_stale_display(tmp_path):
+    """Test that a nonexistent or corrupt saved run returns None instead of old data."""
+    from storage import load_active_assessment
+    saved_dir = str(tmp_path / "saved")
+    os.makedirs(saved_dir, exist_ok=True)
+
+    # Nonexistent run ID
+    assert load_active_assessment("run_nonexistent", saved_dir=saved_dir) is None
+
+    # Corrupt JSON file
+    corrupt_path = os.path.join(saved_dir, "run_corrupt.json")
+    with open(corrupt_path, "w") as fh:
+        fh.write("{ bad json ")
+    assert load_active_assessment("run_corrupt", saved_dir=saved_dir) is None
+
+    # Incomplete record (missing geom_wkt or metrics)
+    incomplete_path = os.path.join(saved_dir, "run_incomplete.json")
+    with open(incomplete_path, "w") as fh:
+        json.dump({"run_id": "run_incomplete"}, fh)
+    assert load_active_assessment("run_incomplete", saved_dir=saved_dir) is None
+
+
+def test_param_key_consistency_with_user_settings():
+    """Test that computing param_key with user max_cloud matches the run's fingerprint."""
+    import copy
+    from runmeta import canonical_settings, param_key, results_are_current
+
+    mode = "live"
+    geom_wkt = "POLYGON ((74.59 19.39, 74.59 19.40, 74.60 19.40, 74.60 19.39, 74.59 19.39))"
+    inc_str = "2026-10-26"
+    workflow_mode = "recent"
+    claimed_peril = "Inundation / Flood"
+    years = [2021, 2022, 2023, 2024]
+    user_max_cloud = 75
+
+    # During assessment execution:
+    eff = copy.deepcopy(CFG)
+    eff["max_cloud_pct"] = user_max_cloud
+    eff["baseline_years"] = sorted(years)
+    run_key = param_key(mode, geom_wkt, [inc_str, workflow_mode, claimed_peril],
+                        eff["baseline_years"], canonical_settings(eff))
+
+    # In dashboard staleness check:
+    eff_cfg = copy.deepcopy(CFG)
+    eff_cfg["max_cloud_pct"] = user_max_cloud
+    current_key = param_key(mode, geom_wkt, [inc_str, workflow_mode, claimed_peril],
+                            sorted(years), canonical_settings(eff_cfg))
+
+    # Must be current — no false staleness warning!
+    assert results_are_current(run_key, current_key) is True
+
+
+def test_assess_field_accepts_unexpected_kwargs_and_claim_info():
+    """Verify assess_field accepts claim_info and unexpected kwargs without error."""
+    with tempfile.TemporaryDirectory() as tmp:
+        mini_cfg = dict(CFG_DEMO)
+        mini_cfg.update({
+            "data_dir": "data",
+            "out_dir": "out",
+            "report_dir": "reports"
+        })
+        geom = box(74.645, 19.385, 74.655, 19.395)
+        claim_info = {
+            "claim_ref": "CLM-2026-TEST",
+            "policy_no": "POL-9999",
+            "claimant_name": "Test Farmer",
+            "crop_type": "Soybean",
+            "claimed_cause": "Inundation / Flood",
+            "incident_date": "2026-08-15"
+        }
+        res = fieldmod.assess_field(
+            mini_cfg, geom, "demo", root=tmp,
+            claim_info=claim_info,
+            unexpected_param_1="foo",
+            unexpected_param_2=123
+        )
+        assert res is not None
+        assert res["claim_info"]["claim_ref"] == "CLM-2026-TEST"
+        assert os.path.exists(res["pdf"])
+        assert os.path.exists(res["geojson"])
+
+
+def test_incident_date_and_observation_window_consistency():
+    """Verify incident date, observation window, and acquisition dates agree across artifacts."""
+    with tempfile.TemporaryDirectory() as tmp:
+        mini_cfg = copy.deepcopy(CFG)
+        procdir = os.path.join(tmp, "proc_test")
+        geom = box(74.645, 19.385, 74.655, 19.395)
+        claimed_date = "2025-08-15"
+        peril = "Flood"
+
+        discovery, meta = incidentmod.fetch_incident_demo(
+            mini_cfg, geom, incident_date=claimed_date, procdir=procdir, peril=peril
+        )
+        # 1. Claimed date must NOT be mutated or replaced
+        assert discovery["incident_date"] == claimed_date
+        assert meta["incident_date"] == claimed_date
+
+        # 2. Observation window must be present and match pre/post dates
+        pre_d = discovery["selected_pre"]["date"]
+        post_d = discovery["selected_post"]["date"]
+        assert meta["event_window"] == [pre_d, post_d]
+
+        # 3. assess_field must record these in metrics
+        claim_info = {"claimed_cause": peril, "incident_date": claimed_date}
+        res = fieldmod.assess_field(
+            mini_cfg, geom, "demo", root=tmp, rasters_dir=procdir, meta=meta, claim_info=claim_info
+        )
+        m = res["metrics"]
+        assert m["incident_date"] == claimed_date
+        assert m["event_window"] == [pre_d, post_d]
+
+        # 4. save_assessment and load_active_assessment must preserve them
+        run_data = {
+            "run_id": res["run_id"],
+            "param_key": res["param_key"],
+            "mode": "demo",
+            "workflow_mode": "historical",
+            "incident_date": claimed_date,
+            "claimed_peril": peril,
+            "event_window": [pre_d, post_d],
+            "baseline_years": [2022, 2023],
+            "discovery": discovery,
+            "geom_wkt": geom.wkt,
+            "res": res,
+            "claim_info": claim_info,
+        }
+        saved_dir = os.path.join(tmp, "saved")
+        save_path = save_assessment(run_data, saved_dir=saved_dir)
+        assert os.path.exists(save_path)
+
+        loaded = load_active_assessment(res["run_id"], saved_dir=saved_dir)
+        assert loaded is not None
+        assert loaded["incident_date"] == claimed_date
+        assert loaded["event_window"] == [pre_d, post_d]
+
+
+def test_damage_calculation_denominators_and_metrics():
+    """Verify damage calculations: pixel counts, denominators, affected %, and severity."""
+    mean, std, ndvi_arr, ndwi_arr = _arrays_for_field()
+    # Mask half the pixels as invalid
+    ndvi_arr[10:, :] = -9999.0
+    area_ha_val = 4.0
+    n_field_px = 400
+
+    m = score_arrays(
+        mask_nodata(ndvi_arr), mask_nodata(ndwi_arr),
+        mask_nodata(mean), mask_nodata(std), CFG,
+        area_ha_=area_ha_val, n_field_pixels=n_field_px
+    )
+
+    # 1. Denominators: valid_pct denominator is n_field_pixels
+    assert m["n_field_pixels"] == 400
+    assert m["n_valid_pixels"] == 200
+    assert m["valid_pct"] == 50.0
+
+    # 2. Affected % denominator is n_valid_pixels
+    assert m["affected_pct"] == pytest.approx(18.0)
+    # 3. Estimated affected area is proportional to total field area
+    expected_ha = round((m["affected_pct"] / 100.0) * area_ha_val, 3)
+    assert m["affected_area_ha"] == pytest.approx(expected_ha)
+    # 4. Severity classification aligns with thresholds
+    assert m["severity"] == "moderate"  # 18% is between 15% and 35%
+
+
+def test_field_report_with_claim_info_and_peril_checklist():
+    """Verify build_field_report generates complete PDF with claim info and checklists."""
+    with tempfile.TemporaryDirectory() as tmp:
+        mini_cfg = copy.deepcopy(CFG)
+        procdir = os.path.join(tmp, "proc")
+        geom = box(74.645, 19.385, 74.655, 19.395)
+        claim_info = {
+            "claim_ref": "CLM-2026-AUDIT",
+            "policy_no": "POL-MH-7711",
+            "claimant_name": "Suresh Kale",
+            "crop_type": "Cotton",
+            "claimed_cause": "Inundation / Flood",
+            "incident_date": "2025-08-15"
+        }
+        discovery, meta = incidentmod.fetch_incident_demo(
+            mini_cfg, geom, incident_date="2025-08-15", procdir=procdir, peril="Inundation / Flood"
+        )
+        res = fieldmod.assess_field(
+            mini_cfg, geom, "demo", root=tmp, rasters_dir=procdir, meta=meta, claim_info=claim_info
+        )
+        pdf_path = res["pdf"]
+        assert os.path.exists(pdf_path)
+        assert os.path.getsize(pdf_path) > 10000  # Non-trivial valid PDF
+
+
+def test_map_safe_geodataframe_serializes_timestamps_to_folium():
+    """Verify that GeoDataFrames containing pd.Timestamp columns (such as incident_date)
+    are properly sanitized by map_safe_geodataframe and render in folium.GeoJson without error."""
+    import folium
+    import pandas as pd
+    import geopandas as gpd
+
+    gdf = gpd.GeoDataFrame({
+        "cell_id": [101],
+        "incident_date": [pd.Timestamp("2026-10-26 12:00:00")],
+        "event_window": [np.array(["2026-10-20", "2026-10-25"])],
+        "affected_pct": [12.5],
+        "severity": ["low"],
+    }, geometry=[box(74.6, 19.3, 74.7, 19.4)], crs="EPSG:4326")
+
+    safe_gdf = fieldmod.map_safe_geodataframe(gdf)
+    assert isinstance(safe_gdf.iloc[0]["incident_date"], str)
+    assert safe_gdf.iloc[0]["incident_date"].startswith("2026-10-26")
+
+    # folium.GeoJson uses json.dumps(data.__geo_interface__) which previously crashed
+    geojson_layer = folium.GeoJson(safe_gdf)
+    assert geojson_layer is not None
 
 
 if __name__ == "__main__":
